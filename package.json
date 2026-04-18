@@ -1,11 +1,15 @@
 {
   "name": "blackpine-backend",
   "version": "1.0.0",
+  "engines": {
+  "node": ">=18"
+  },
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts"
+  "dev": "tsx watch src/server.ts",
+  "start": "tsx src/server.ts",
+  "build": "echo 'no build needed'"
   },
   "keywords": [],
   "author": "",

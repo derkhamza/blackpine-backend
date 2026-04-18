@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import path from "path";
 
-const DB_PATH = path.join(__dirname, "..", "..", "data", "blackpine.db");
+const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, "..", "..", "data", "blackpine.db");
 
 // Ensure the data directory exists
 import fs from "fs";

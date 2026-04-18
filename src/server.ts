@@ -29,7 +29,6 @@ app.use("/ocr", authRequired, ocrRoutes);
 // Initialize database and start
 initDatabase();
 
-app.listen(PORT, () => {
-  console.log(`\n[SERVER] Blackpine backend running on http://localhost:${PORT}`);
-  console.log(`[SERVER] Health check: http://localhost:${PORT}/health\n`);
+app.listen(Number(PORT), "0.0.0.0", () => {
+  console.log(`\n[SERVER] Blackpine backend running on port ${PORT}`);
 });
