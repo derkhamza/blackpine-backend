@@ -1,22 +1,29 @@
-import Database from "better-sqlite3";
-import path from "path";
+import { createClient, Client } from "@libsql/client";
 
-const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, "..", "..", "data", "blackpine.db");
+let db: Client;
 
-// Ensure the data directory exists
-import fs from "fs";
-const dataDir = path.dirname(DB_PATH);
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+export function getDb(): Client {
+  if (!db) {
+    throw new Error("Database not initialized. Call initDatabase() first.");
+  }
+  return db;
 }
 
-const db = new Database(DB_PATH);
+export async function initDatabase(): Promise<void> {
+  const url = process.env.TURSO_DATABASE_URL;
+  const authToken = process.env.TURSO_AUTH_TOKEN;
 
-// Enable WAL mode for better concurrent read performance
-db.pragma("journal_mode = WAL");
+  if (!url) {
+    throw new Error("TURSO_DATABASE_URL environment variable is required");
+  }
 
-export function initDatabase() {
-  db.exec(`
+  db = createClient({
+    url,
+    authToken,
+  });
+
+  // Create tables
+  await db.executeMultiple(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       email TEXT UNIQUE NOT NULL,
@@ -26,14 +33,14 @@ export function initDatabase() {
     );
 
     CREATE TABLE IF NOT EXISTS profiles (
-      user_id TEXT PRIMARY KEY REFERENCES users(id),
+      user_id TEXT PRIMARY KEY,
       data TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS transactions (
       id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL REFERENCES users(id),
+      user_id TEXT NOT NULL,
       data TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -42,7 +49,7 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id);
   `);
 
-  console.log("[DB] Database initialized at", DB_PATH);
+  console.log("[DB] Connected to Turso database");
 }
 
-export default db;
+export default { getDb };

@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { v4 as uuid } from "uuid";
-import db from "../db/database";
+import { getDb } from "../db/database";
 import { generateToken } from "../middleware/auth";
 
 const router = Router();
@@ -17,23 +17,26 @@ router.post("/signup", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Le mot de passe doit contenir au moins 6 caractères" });
     }
 
-    // Check if email exists
-    const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
-    if (existing) {
+    const db = getDb();
+
+    const existing = await db.execute({
+      sql: "SELECT id FROM users WHERE email = ?",
+      args: [email.toLowerCase().trim()],
+    });
+
+    if (existing.rows.length > 0) {
       return res.status(409).json({ error: "Un compte existe déjà avec cet email" });
     }
 
     const id = uuid();
     const passwordHash = await bcrypt.hash(password, 12);
 
-    db.prepare("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)").run(
-      id,
-      email.toLowerCase().trim(),
-      passwordHash
-    );
+    await db.execute({
+      sql: "INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)",
+      args: [id, email.toLowerCase().trim(), passwordHash],
+    });
 
     const token = generateToken({ userId: id, email });
-
     console.log(`[AUTH] New user registered: ${email}`);
 
     return res.status(201).json({
@@ -54,21 +57,25 @@ router.post("/login", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Email et mot de passe requis" });
     }
 
-    const user = db
-      .prepare("SELECT id, email, password_hash FROM users WHERE email = ?")
-      .get(email.toLowerCase().trim()) as any;
+    const db = getDb();
 
-    if (!user) {
+    const result = await db.execute({
+      sql: "SELECT id, email, password_hash FROM users WHERE email = ?",
+      args: [email.toLowerCase().trim()],
+    });
+
+    if (result.rows.length === 0) {
       return res.status(401).json({ error: "Email ou mot de passe incorrect" });
     }
 
-    const valid = await bcrypt.compare(password, user.password_hash);
+    const user = result.rows[0];
+    const valid = await bcrypt.compare(password, user.password_hash as string);
+
     if (!valid) {
       return res.status(401).json({ error: "Email ou mot de passe incorrect" });
     }
 
-    const token = generateToken({ userId: user.id, email: user.email });
-
+    const token = generateToken({ userId: user.id as string, email: user.email as string });
     console.log(`[AUTH] User logged in: ${email}`);
 
     return res.json({
@@ -82,7 +89,6 @@ router.post("/login", async (req: Request, res: Response) => {
 });
 
 router.get("/me", (req: Request, res: Response) => {
-  // This route is protected by authRequired middleware in the main server
   const user = (req as any).user;
   return res.json({ user });
 });
