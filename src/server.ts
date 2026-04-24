@@ -6,6 +6,7 @@ import syncRoutes from "./routes/sync";
 import ocrRoutes from "./routes/ocr";
 import { authRequired } from "./middleware/auth";
 import "dotenv/config";
+import resetRoutes from "./routes/reset";
 
 const PORT = process.env.PORT || 3001;
 
@@ -19,6 +20,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.use("/auth", authRoutes);
+app.use("/reset", resetRoutes);
 app.use("/sync", authRequired, syncRoutes);
 app.use("/ocr", authRequired, ocrRoutes);
 

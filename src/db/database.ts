@@ -46,6 +46,15 @@ export async function initDatabase(): Promise<void> {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS reset_codes (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      code TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id);
   `);
 
