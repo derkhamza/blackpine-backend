@@ -1,8 +1,9 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
-import { v4 as uuid } from "uuid";
 import { getDb } from "../db/database";
 import { sendResetCode } from "../email/emailService";
+import crypto from "crypto";
+const uuid = () => crypto.randomUUID();
 
 const router = Router();
 
