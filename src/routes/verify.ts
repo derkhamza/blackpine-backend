@@ -1,6 +1,24 @@
 import { Router } from "express";
 import { getDb } from "../db";
 import { sendEmail } from "../email/emailService";
+import { Resend } from "resend";
+
+async function sendVerificationEmail(to: string, code: string): Promise<void> {
+  const resend = new Resend(process.env.RESEND_API_KEY);
+  await resend.emails.send({
+    from: "Blackpine Cabinet <onboarding@resend.dev>",
+    to,
+    subject: "Blackpine Cabinet — Code de vérification",
+    html: `<div style="font-family: Arial, sans-serif; max-width: 400px; margin: 0 auto; padding: 20px;">
+      <h2 style="color: #1A7F64; text-align: center;">BLACKPINE CABINET</h2>
+      <p style="text-align: center; color: #666;">Votre code de vérification :</p>
+      <div style="text-align: center; font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #1A7F64; padding: 20px; background: #E3F5EF; border-radius: 10px; margin: 20px 0;">
+        ${code}
+      </div>
+      <p style="text-align: center; color: #999; font-size: 12px;">Ce code expire dans 10 minutes.</p>
+    </div>`,
+  });
+}
 
 const router = Router();
 
@@ -22,18 +40,7 @@ router.post("/send-code", async (req, res) => {
       expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
     });
 
-    await sendEmail(
-      email,
-      "Blackpine Cabinet — Code de vérification",
-      `<div style="font-family: Arial, sans-serif; max-width: 400px; margin: 0 auto; padding: 20px;">
-        <h2 style="color: #1A7F64; text-align: center;">BLACKPINE CABINET</h2>
-        <p style="text-align: center; color: #666;">Votre code de vérification :</p>
-        <div style="text-align: center; font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #1A7F64; padding: 20px; background: #E3F5EF; border-radius: 10px; margin: 20px 0;">
-          ${code}
-        </div>
-        <p style="text-align: center; color: #999; font-size: 12px;">Ce code expire dans 10 minutes.</p>
-      </div>`
-    );
+await sendVerificationEmail(email, code);
 
     res.json({ success: true });
   } catch (err: any) {

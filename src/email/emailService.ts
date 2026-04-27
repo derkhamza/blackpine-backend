@@ -22,3 +22,14 @@ export async function sendResetCode(to: string, code: string): Promise<void> {
   });
   console.log(`[EMAIL] Reset code sent to ${to}`);
 }
+
+export async function sendEmail(to: string, subject: string, html: string): Promise<void> {
+  const { Resend } = require("resend");
+  const resend = new Resend(process.env.RESEND_API_KEY);
+  await resend.emails.send({
+    from: "Blackpine Cabinet <onboarding@resend.dev>",
+    to,
+    subject,
+    html,
+  });
+}
