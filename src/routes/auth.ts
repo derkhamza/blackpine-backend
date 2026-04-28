@@ -33,8 +33,8 @@ router.post("/signup", async (req: Request, res: Response) => {
     const passwordHash = await bcrypt.hash(password, 12);
 
     await db.execute({
-      sql: "INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)",
-      args: [id, email.toLowerCase().trim(), passwordHash],
+      sql: "INSERT INTO users (id, email, password_hash, trial_start) VALUES (?, ?, ?, ?)",
+      args: [id, email.toLowerCase().trim(), passwordHash, new Date().toISOString()],
     });
 
     // After: await db.execute({ sql: "INSERT INTO users ...", args: [...] });
@@ -68,7 +68,7 @@ router.post("/login", async (req: Request, res: Response) => {
     const db = getDb();
 
     const result = await db.execute({
-      sql: "SELECT id, email, password_hash FROM users WHERE email = ?",
+      sql: "SELECT id, email, password_hash, trial_start FROM users WHERE email = ?",
       args: [email.toLowerCase().trim()],
     });
 
@@ -88,7 +88,7 @@ router.post("/login", async (req: Request, res: Response) => {
 
     return res.json({
       token,
-      user: { id: user.id, email: user.email },
+      user: { id: user.id, email: user.email, trialStart : user.trial_start },
     });
   } catch (err: any) {
     console.error("[AUTH] Login error:", err.message);
