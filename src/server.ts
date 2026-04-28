@@ -7,6 +7,7 @@ import ocrRoutes from "./routes/ocr";
 import { authRequired } from "./middleware/auth";
 import "dotenv/config";
 import resetRoutes from "./routes/reset";
+import subscriptionRouter from "../src/routes/subscription";
 
 const PORT = process.env.PORT || 3001;
 
@@ -14,7 +15,7 @@ const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
-
+app.use("/api/subscription", subscriptionRouter);
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "blackpine-backend" });
 });

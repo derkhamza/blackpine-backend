@@ -46,6 +46,7 @@ export async function initDatabase(): Promise<void> {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+
     CREATE TABLE IF NOT EXISTS reset_codes (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -55,6 +56,16 @@ export async function initDatabase(): Promise<void> {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS activation_codes (
+  code TEXT PRIMARY KEY,
+  plan TEXT NOT NULL,
+  duration_days INTEGER,
+  customer_email TEXT,
+  customer_name TEXT,
+  created_at TEXT NOT NULL,
+  used INTEGER DEFAULT 0,
+  used_at TEXT
+)
     CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id);
   `);
 
