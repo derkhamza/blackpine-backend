@@ -64,8 +64,7 @@ export async function initDatabase(): Promise<void> {
   customer_name TEXT,
   created_at TEXT NOT NULL,
   used INTEGER DEFAULT 0,
-  used_at TEXT
-);
+  used_at TEXT);
     CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id);
   `);
 
