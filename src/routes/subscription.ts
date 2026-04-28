@@ -1,16 +1,21 @@
 import { Router } from "express";
 import { getDb } from "../db/database";
-import crypto from "crypto";
+function generateActivationCode(): string {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "BP-";
+  for (let i = 0; i < 8; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
 
 const router = Router();
 
-function generateActivationCode(): string {
-  return "BP-" + crypto.randomBytes(4).toString("hex").toUpperCase();
-}
 
 // Admin endpoint: generate codes (protect with a secret)
 router.post("/generate-code", async (req, res) => {
   try {
+    console.log("[SUB] generate-code body:", JSON.stringify(req.body));
     const { adminSecret, plan, durationDays, customerEmail, customerName } = req.body;
     if (adminSecret !== process.env.ADMIN_SECRET) {
       return res.status(403).json({ error: "Non autorisé" });
