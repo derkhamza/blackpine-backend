@@ -37,6 +37,13 @@ router.post("/signup", async (req: Request, res: Response) => {
       args: [id, email.toLowerCase().trim(), passwordHash],
     });
 
+    // After: await db.execute({ sql: "INSERT INTO users ...", args: [...] });
+// Add:
+await db.execute({
+  sql: "UPDATE users SET trial_start = ? WHERE email = ?",
+  args: [new Date().toISOString(), email.toLowerCase().trim()],
+});
+
     const token = generateToken({ userId: id, email });
     console.log(`[AUTH] New user registered: ${email}`);
 
@@ -94,4 +101,28 @@ router.get("/me", (req: Request, res: Response) => {
   return res.json({ user });
 });
 
+router.get("/trial-status", async (req: Request, res: Response) => {
+  try {
+    const { email } = req.query;
+    if (!email) return res.status(400).json({ error: "Email requis" });
+
+    const db = getDb();
+    const result = await db.execute({
+      sql: "SELECT trial_start FROM users WHERE email = ?",
+      args: [String(email).toLowerCase().trim()],
+    });
+
+    if (result.rows.length === 0) return res.status(404).json({ error: "Utilisateur non trouvé" });
+
+    const trialStart = result.rows[0].trial_start as string;
+    const startDate = new Date(trialStart);
+    const now = new Date();
+    const daysElapsed = Math.floor((now.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+    const daysLeft = Math.max(0, 30 - daysElapsed);
+
+    res.json({ trialStart, daysElapsed, daysLeft, expired: daysLeft <= 0 });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
 export default router;

@@ -67,7 +67,11 @@ export async function initDatabase(): Promise<void> {
   used_at TEXT);
     CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id);
   `);
-
+    try {
+      await db.execute("ALTER TABLE users ADD COLUMN trial_start TEXT");
+    } catch (e) {
+      // Column already exists
+    }
   console.log("[DB] Connected to Turso database");
 }
 
