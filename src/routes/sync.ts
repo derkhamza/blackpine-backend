@@ -20,17 +20,21 @@ router.get("/pull", async (req: Request, res: Response) => {
 
     const profileRow = profileResult.rows[0];
     const transactionRows = txResult.rows;
-const profileData = profileRow ? JSON.parse(profileRow.data as string) : null;
+      const profileData = profileRow ? JSON.parse(profileRow.data as string) : null;
     const assets = profileData?._assets || [];
-    if (profileData) delete profileData._assets;
-    
+    const recurringRules = profileData?._recurringRules || [];
+    if (profileData) {
+      delete profileData._assets;
+      delete profileData._recurringRules;
+    }
     return res.json({
       profile: profileRow ? JSON.parse(profileRow.data as string) : null,
       profileUpdatedAt: profileRow?.updated_at ?? null,
       transactions: transactionRows.map((r: any) => ({
         ...JSON.parse(r.data as string),
         id: r.id,
-        assets
+        assets,
+        recurringRules,
       })),
       transactionsUpdatedAt:
         transactionRows.length > 0
@@ -46,8 +50,7 @@ const profileData = profileRow ? JSON.parse(profileRow.data as string) : null;
 router.post("/push", async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
-    const { profile, transactions, assets } = req.body;
-
+    const { profile, transactions, assets, recurringRules } = req.body;
     if (!profile) {
       return res.status(400).json({ error: "Profile requis" });
     }
@@ -58,13 +61,13 @@ router.post("/push", async (req: Request, res: Response) => {
     // Upsert profile
 // Upsert assets
 // Upsert profile (includes assets)
-    const profileWithAssets = { ...profile, _assets: assets || [] };
+const profileWithExtras = { ...profile, _assets: assets || [], _recurringRules: recurringRules || [] };
     await db.execute({
       sql: `INSERT INTO profiles (user_id, data, updated_at)
             VALUES (?, ?, ?)
             ON CONFLICT(user_id)
             DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`,
-      args: [userId, JSON.stringify(profileWithAssets), now],
+      args: [userId, JSON.stringify(profileWithExtras), now],
     });
 
     // Delete old transactions
