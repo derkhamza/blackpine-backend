@@ -9,6 +9,8 @@ import resetRoutes from "../src/routes/reset";
 import verifyRouter from "../src/routes/verify";
 import subscriptionRouter from "../src/routes/subscription";
 import { authRequired } from "../src/middleware/auth";
+import ocrProxyRouter from "../src/routes/ocrProxy";
+app.use("/ocr-proxy", ocrProxyRouter);
 
 const app = express();
 app.use(cors());
