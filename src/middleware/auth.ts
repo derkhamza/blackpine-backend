@@ -2,7 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 
 const JWT_SECRET = process.env.JWT_SECRET || "blackpine-dev-secret-change-in-production";
-const TOKEN_EXPIRY = "30d";
+const TOKEN_EXPIRY = "365d";
 
 export interface AuthPayload {
   userId: string;
