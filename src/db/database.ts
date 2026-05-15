@@ -66,13 +66,37 @@ export async function initDatabase(): Promise<void> {
   used INTEGER DEFAULT 0,
   used_at TEXT);
     CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id);
+
+    CREATE TABLE IF NOT EXISTS invite_codes (
+      code TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      used INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS secretary_sessions (
+      id TEXT PRIMARY KEY,
+      code TEXT NOT NULL,
+      owner_user_id TEXT NOT NULL,
+      token TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      revoked INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS cabinet_snapshots (
+      owner_user_id TEXT PRIMARY KEY,
+      appointments TEXT NOT NULL DEFAULT '[]',
+      patients TEXT NOT NULL DEFAULT '[]',
+      doctor_profile TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_invite_codes_owner ON invite_codes(owner_user_id);
+    CREATE INDEX IF NOT EXISTS idx_secretary_sessions_owner ON secretary_sessions(owner_user_id);
   `);
-    try {
-      await db.execute("ALTER TABLE users ADD COLUMN trial_start TEXT");
-    } catch (e) {
-      // Column already exists
-    }
+    try { await db.execute("ALTER TABLE users ADD COLUMN trial_start TEXT"); } catch {}
+    try { await db.execute("ALTER TABLE users ADD COLUMN subscription_plan TEXT DEFAULT 'free_trial'"); } catch {}
+    try { await db.execute("ALTER TABLE users ADD COLUMN subscription_expires_at TEXT"); } catch {}
   console.log("[DB] Connected to Turso database");
 }
-
-export default { getDb };
