@@ -25,13 +25,27 @@ export async function subscriptionRequired(req: Request, res: Response, next: Ne
       return res.status(403).json({ error: "subscription_expired", plan });
     }
 
-    const trialStart = row.trial_start as string | null;
-    if (!trialStart) return res.status(403).json({ error: "subscription_expired" });
+    let trialStart = row.trial_start as string | null;
+
+    // Backfill NULL trial_start for accounts created before trial tracking was added.
+    // Give them a fresh 30-day window from today rather than blocking immediately.
+    if (!trialStart) {
+      trialStart = new Date().toISOString();
+      try {
+        await db.execute({
+          sql: "UPDATE users SET trial_start = ? WHERE id = ?",
+          args: [trialStart, user.userId],
+        });
+      } catch (updateErr: any) {
+        console.error("[SUBSCRIPTION] Failed to backfill trial_start:", updateErr.message);
+      }
+    }
 
     const daysElapsed = Math.floor((Date.now() - new Date(trialStart).getTime()) / (1000 * 60 * 60 * 24));
     if (daysElapsed < TRIAL_DAYS) return next();
 
-    return res.status(403).json({ error: "subscription_expired", daysLeft: 0 });
+    // Return trialStart so the client can correct its local state
+    return res.status(403).json({ error: "subscription_expired", trialStart, daysLeft: 0 });
   } catch (err: any) {
     console.error("[SUBSCRIPTION] Check failed:", err.message);
     next();
