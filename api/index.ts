@@ -9,7 +9,6 @@ import resetRoutes from "../src/routes/reset";
 import verifyRouter from "../src/routes/verify";
 import subscriptionRouter from "../src/routes/subscription";
 import { authRequired } from "../src/middleware/auth";
-import { subscriptionRequired } from "../src/middleware/subscription";
 import ocrProxyRouter from "../src/routes/ocrProxy";
 import inviteRoutes from "../src/routes/invite";
 import cabinetRoutes from "../src/routes/cabinet";
@@ -30,7 +29,7 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "blackpine-backend" });
 });
 
-app.use("/sync", authRequired, subscriptionRequired, syncRoutes);
+app.use("/sync", authRequired, syncRoutes);
 app.use("/ocr", authRequired, ocrRoutes);
 app.use("/invite", rateLimit(10, 15 * 60 * 1000), inviteRoutes);
 app.use("/cabinet", cabinetRoutes);
