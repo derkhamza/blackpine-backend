@@ -361,7 +361,7 @@ router.get("/doctors/:id", authRequired, async (req: Request, res: Response) => 
 const VALID_PLANS = ["free_trial", "pro", "premium", "lifetime"];
 
 // Every table that references a user, with its key column (used for deletion).
-const USER_TABLES: { table: string; col: string }[] = [
+export const USER_TABLES: { table: string; col: string }[] = [
   { table: "profiles",           col: "user_id" },
   { table: "transactions",       col: "user_id" },
   { table: "reset_codes",        col: "user_id" },

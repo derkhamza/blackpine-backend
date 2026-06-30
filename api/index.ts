@@ -19,6 +19,7 @@ import smsRoutes from "../src/routes/sms";
 import pushRoutes from "../src/routes/push";
 import adminRoutes from "../src/routes/admin";
 import eventsRoutes from "../src/routes/events";
+import accountRoutes from "../src/routes/account";
 import { rateLimit } from "../src/middleware/rateLimit";
 import { isCipherActive } from "../src/crypto/dataCipher";
 
@@ -53,6 +54,8 @@ app.use("/push", rateLimit(30, 15 * 60 * 1000), pushRoutes);
 app.use("/admin", rateLimit(60, 15 * 60 * 1000), adminRoutes);
 // Behavioural analytics ingestion (auth).
 app.use("/events", rateLimit(120, 15 * 60 * 1000), eventsRoutes);
+// Self-service account + data deletion (auth, GDPR / Play requirement).
+app.use("/account", rateLimit(10, 15 * 60 * 1000), authRequired, accountRoutes);
 
 // De-duplicate initialization across concurrent cold-start requests: they all
 // await the same promise instead of each running the full schema sweep. If init
