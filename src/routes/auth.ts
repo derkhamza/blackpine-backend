@@ -31,25 +31,19 @@ router.post("/signup", async (req: Request, res: Response) => {
 
     const id = uuid();
     const passwordHash = await bcrypt.hash(password, 12);
+    const trialStart = new Date().toISOString();
 
     await db.execute({
       sql: "INSERT INTO users (id, email, password_hash, trial_start) VALUES (?, ?, ?, ?)",
-      args: [id, email.toLowerCase().trim(), passwordHash, new Date().toISOString()],
+      args: [id, email.toLowerCase().trim(), passwordHash, trialStart],
     });
-
-    // After: await db.execute({ sql: "INSERT INTO users ...", args: [...] });
-// Add:
-await db.execute({
-  sql: "UPDATE users SET trial_start = ? WHERE email = ?",
-  args: [new Date().toISOString(), email.toLowerCase().trim()],
-});
 
     const token = generateToken({ userId: id, email });
     console.log(`[AUTH] New user registered: ${email}`);
 
     return res.status(201).json({
       token,
-      user: { id, email },
+      user: { id, email, trialStart, subscriptionPlan: "free_trial", subscriptionExpiresAt: null },
     });
   } catch (err: any) {
     console.error("[AUTH] Signup error:", err.message);
@@ -68,7 +62,7 @@ router.post("/login", async (req: Request, res: Response) => {
     const db = getDb();
 
     const result = await db.execute({
-      sql: "SELECT id, email, password_hash, trial_start FROM users WHERE email = ?",
+      sql: "SELECT id, email, password_hash, trial_start, subscription_plan, subscription_expires_at FROM users WHERE email = ?",
       args: [email.toLowerCase().trim()],
     });
 
@@ -88,7 +82,13 @@ router.post("/login", async (req: Request, res: Response) => {
 
     return res.json({
       token,
-      user: { id: user.id, email: user.email, trialStart : user.trial_start },
+      user: {
+        id: user.id,
+        email: user.email,
+        trialStart: user.trial_start,
+        subscriptionPlan: user.subscription_plan || "free_trial",
+        subscriptionExpiresAt: user.subscription_expires_at || null,
+      },
     });
   } catch (err: any) {
     console.error("[AUTH] Login error:", err.message);
@@ -125,4 +125,5 @@ router.get("/trial-status", async (req: Request, res: Response) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 export default router;

@@ -3,6 +3,7 @@ import { getDb } from "../db/database";
 import { authRequired } from "../middleware/auth";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
+import { decryptField } from "../crypto/dataCipher";
 
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || "blackpine-dev-secret-change-in-production";
@@ -85,7 +86,7 @@ router.post("/redeem", async (req: Request, res: Response) => {
     });
     const profileData =
       profileResult.rows[0]
-        ? JSON.parse(profileResult.rows[0].data as string)
+        ? JSON.parse(decryptField(profileResult.rows[0].data as string))
         : {};
     const ownerName =
       profileData?.firstName && profileData?.lastName

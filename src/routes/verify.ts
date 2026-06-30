@@ -1,7 +1,7 @@
 import { Router } from "express";
-import { getDb } from "../db";
-import { sendEmail } from "../email/emailService";
 import { Resend } from "resend";
+
+const generateCode = () => String(Math.floor(100000 + Math.random() * 900000));
 
 async function sendVerificationEmail(to: string, code: string): Promise<void> {
   const resend = new Resend(process.env.RESEND_API_KEY);
@@ -22,12 +22,7 @@ async function sendVerificationEmail(to: string, code: string): Promise<void> {
 
 const router = Router();
 
-// Store codes in memory (simple approach — resets on deploy)
 const verificationCodes = new Map<string, { code: string; expiresAt: number }>();
-
-function generateCode(): string {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
 
 router.post("/send-code", async (req, res) => {
   try {
@@ -37,10 +32,10 @@ router.post("/send-code", async (req, res) => {
     const code = generateCode();
     verificationCodes.set(email.toLowerCase(), {
       code,
-      expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
+      expiresAt: Date.now() + 10 * 60 * 1000,
     });
 
-await sendVerificationEmail(email, code);
+    await sendVerificationEmail(email, code);
 
     res.json({ success: true });
   } catch (err: any) {

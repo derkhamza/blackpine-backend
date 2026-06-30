@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../db/database";
+import { encryptField, decryptField } from "../crypto/dataCipher";
 
 const router = Router();
 
@@ -7,6 +8,11 @@ router.get("/pull", async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
     const db = getDb();
+
+    const userResult = await db.execute({
+      sql: "SELECT trial_start, subscription_plan, subscription_expires_at FROM users WHERE id = ?",
+      args: [userId],
+    });
 
     const profileResult = await db.execute({
       sql: "SELECT data, updated_at FROM profiles WHERE user_id = ?",
@@ -20,18 +26,19 @@ router.get("/pull", async (req: Request, res: Response) => {
 
     const profileRow = profileResult.rows[0];
     const transactionRows = txResult.rows;
-      const profileData = profileRow ? JSON.parse(profileRow.data as string) : null;
+      const profileData = profileRow ? JSON.parse(decryptField(profileRow.data as string)) : null;
     const assets = profileData?._assets || [];
     const recurringRules = profileData?._recurringRules || [];
     if (profileData) {
       delete profileData._assets;
       delete profileData._recurringRules;
     }
+    const userRow = userResult.rows[0];
     return res.json({
-      profile: profileRow ? JSON.parse(profileRow.data as string) : null,
+      profile: profileRow ? JSON.parse(decryptField(profileRow.data as string)) : null,
       profileUpdatedAt: profileRow?.updated_at ?? null,
       transactions: transactionRows.map((r: any) => ({
-        ...JSON.parse(r.data as string),
+        ...JSON.parse(decryptField(r.data as string)),
         id: r.id,
         assets,
         recurringRules,
@@ -40,6 +47,11 @@ router.get("/pull", async (req: Request, res: Response) => {
         transactionRows.length > 0
           ? transactionRows[transactionRows.length - 1].updated_at
           : null,
+      subscription: userRow ? {
+        trialStart: userRow.trial_start,
+        plan: userRow.subscription_plan || "free_trial",
+        expiresAt: userRow.subscription_expires_at || null,
+      } : null,
     });
   } catch (err: any) {
     console.error("[SYNC] Pull error:", err.message);
@@ -67,7 +79,7 @@ const profileWithExtras = { ...profile, _assets: assets || [], _recurringRules: 
             VALUES (?, ?, ?)
             ON CONFLICT(user_id)
             DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`,
-      args: [userId, JSON.stringify(profileWithExtras), now],
+      args: [userId, encryptField(JSON.stringify(profileWithExtras)), now],
     });
 
     // Delete old transactions
@@ -80,7 +92,7 @@ const profileWithExtras = { ...profile, _assets: assets || [], _recurringRules: 
     for (const tx of transactions || []) {
       await db.execute({
         sql: "INSERT OR REPLACE INTO transactions (id, user_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        args: [tx.id, userId, JSON.stringify(tx), now, now],
+        args: [tx.id, userId, encryptField(JSON.stringify(tx)), now, now],
       });
     }
 

@@ -17,7 +17,7 @@ router.post("/extract", async (req, res) => {
       isOverlayRequired: "false",
       detectOrientation: "true",
       scale: "true",
-      OCREngine: "2",
+      OCREngine: "1",
     });
 
     const ocrRes = await fetch("https://api.ocr.space/parse/image", {

@@ -1,5 +1,7 @@
 import { Router } from "express";
 import { getDb } from "../db/database";
+import { authRequired } from "../middleware/auth";
+
 function generateActivationCode(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "BP-";
@@ -11,11 +13,8 @@ function generateActivationCode(): string {
 
 const router = Router();
 
-
-// Admin endpoint: generate codes (protect with a secret)
 router.post("/generate-code", async (req, res) => {
   try {
-    console.log("[SUB] generate-code body:", JSON.stringify(req.body));
     const { adminSecret, plan, durationDays, customerEmail, customerName } = req.body;
     if (adminSecret !== process.env.ADMIN_SECRET) {
       return res.status(403).json({ error: "Non autorisé" });
@@ -34,12 +33,13 @@ router.post("/generate-code", async (req, res) => {
   }
 });
 
-// Validate and consume a code
-router.post("/validate-code", async (req, res) => {
+// Validate and consume a code — requires auth so we can tie the plan to the user
+router.post("/validate-code", authRequired, async (req, res) => {
   try {
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: "Code requis" });
 
+    const userId = (req as any).user.userId;
     const db = getDb();
     const result = await db.execute({
       sql: "SELECT * FROM activation_codes WHERE code = ? AND used = 0",
@@ -51,24 +51,30 @@ router.post("/validate-code", async (req, res) => {
     }
 
     const row = result.rows[0];
+    const now = new Date().toISOString();
 
-    // Mark as used
+    const expiresAt = row.duration_days
+      ? new Date(Date.now() + (row.duration_days as number) * 24 * 60 * 60 * 1000).toISOString()
+      : null;
+
     await db.execute({
       sql: "UPDATE activation_codes SET used = 1, used_at = ? WHERE code = ?",
-      args: [new Date().toISOString(), code.toUpperCase().trim()],
+      args: [now, code.toUpperCase().trim()],
     });
 
-    res.json({
-      valid: true,
-      plan: row.plan,
-      durationDays: row.duration_days,
+    await db.execute({
+      sql: "UPDATE users SET subscription_plan = ?, subscription_expires_at = ? WHERE id = ?",
+      args: [row.plan, expiresAt, userId],
     });
+
+    console.log(`[SUB] User ${userId} activated plan=${row.plan} expires=${expiresAt}`);
+
+    res.json({ valid: true, plan: row.plan, durationDays: row.duration_days, expiresAt });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// List codes (admin)
 router.get("/codes", async (req, res) => {
   try {
     const { adminSecret } = req.query;
