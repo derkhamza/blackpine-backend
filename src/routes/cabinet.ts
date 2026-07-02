@@ -576,6 +576,27 @@ router.post(
       const serverAppts = cur.rows.length ? JSON.parse(decryptField(cur.rows[0].appointments as string)) : [];
       let merged = mergeSecretaryWrite(serverAppts, appointments ?? [], SECRETARY_APPT_FIELDS);
 
+      // Secretaries take measurements: accept consultationNote.extraFields
+      // (bilan clinique spécialisé / specialty measurement fields) key-by-key,
+      // while every other part of the clinical note (motif, examen, diagnostic,
+      // traitement) stays exactly as the doctor wrote it on the server.
+      const incApptById = new Map<string, any>(
+        (appointments ?? []).filter((x: any) => x && x.id).map((x: any) => [x.id, x]),
+      );
+      merged = merged.map((a: any) => {
+        const inc = incApptById.get(a.id);
+        const incExtra = inc?.consultationNote?.extraFields;
+        if (!incExtra || typeof incExtra !== "object") return a;
+        const srvNote = a.consultationNote ?? {};
+        return {
+          ...a,
+          consultationNote: {
+            ...srvNote,
+            extraFields: { ...(srvNote.extraFields ?? {}), ...incExtra },
+          },
+        };
+      });
+
       // Secretaries manage the schedule, so explicit appointment deletions are
       // honoured — but only via this explicit id list (a stale/partial push can
       // still never silently drop records).
@@ -606,7 +627,7 @@ router.post(
   async (req: Request, res: Response) => {
     try {
       const { ownerUserId } = (req as any).secretary;
-      const { patients } = req.body;
+      const { patients, deletedIds } = req.body;
       const db = getDb();
       const now = new Date().toISOString();
 
@@ -625,7 +646,15 @@ router.post(
         args: [ownerUserId],
       });
       const serverPatients = cur.rows.length ? JSON.parse(decryptField(cur.rows[0].patients as string)) : [];
-      const merged = mergeSecretaryWrite(serverPatients, patients ?? [], SECRETARY_PATIENT_FIELDS);
+      let merged = mergeSecretaryWrite(serverPatients, patients ?? [], SECRETARY_PATIENT_FIELDS);
+
+      // Secretaries manage the patient desk, so explicit record deletions are
+      // honoured — only via this explicit id list (a stale/partial push can
+      // still never silently drop records).
+      if (Array.isArray(deletedIds) && deletedIds.length > 0) {
+        const gone = new Set(deletedIds.filter((x: unknown) => typeof x === "string"));
+        merged = merged.filter((p: any) => !gone.has(p.id));
+      }
 
       await db.execute({
         sql: "UPDATE cabinet_snapshots SET patients = ?, updated_at = ? WHERE owner_user_id = ?",
