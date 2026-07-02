@@ -531,19 +531,24 @@ router.get("/pull", secretaryAuthRequired, async (req: Request, res: Response) =
     const db = getDb();
 
     const result = await db.execute({
-      sql: "SELECT appointments, patients, doctor_profile FROM cabinet_snapshots WHERE owner_user_id = ?",
+      sql: "SELECT appointments, patients, doctor_profile, extra_data FROM cabinet_snapshots WHERE owner_user_id = ?",
       args: [ownerUserId],
     });
 
     if (result.rows.length === 0) {
-      return res.json({ appointments: [], patients: [], doctorProfile: {} });
+      return res.json({ appointments: [], patients: [], doctorProfile: {}, apptDocuments: [] });
     }
 
     const row = result.rows[0];
+    const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
     return res.json({
       appointments: JSON.parse(decryptField(row.appointments as string)),
       patients: JSON.parse(decryptField(row.patients as string)),
       doctorProfile: JSON.parse(decryptField(row.doctor_profile as string)),
+      // Appointment attachments: the desk attaches analyses / mutuelle forms /
+      // scans, so the secretary sees and adds them (no other extra collection
+      // is exposed to secretary sessions).
+      apptDocuments: Array.isArray(extra.apptDocuments) ? extra.apptDocuments : [],
     });
   } catch (err: any) {
     console.error("[CABINET] Pull error:", err.message);
@@ -618,6 +623,60 @@ router.post(
       return res.json({ success: true, updatedAt: now, appointments: merged });
     } catch (err: any) {
       console.error("[CABINET] Appointments update error:", err.message);
+      return res.status(500).json({ error: "Erreur lors de la mise à jour" });
+    }
+  },
+);
+
+// POST /cabinet/appt-documents — secretary adds appointment attachments.
+// Append-only by id (an existing server document is never modified by a
+// secretary push); explicit deletions travel in deletedIds, like the other
+// secretary slices. All other extra_data collections are untouched.
+router.post(
+  "/appt-documents",
+  secretaryAuthRequired,
+  async (req: Request, res: Response) => {
+    try {
+      const { ownerUserId } = (req as any).secretary;
+      const { documents, deletedIds } = req.body;
+      const db = getDb();
+      const now = new Date().toISOString();
+
+      await db.execute({
+        sql: `INSERT OR IGNORE INTO cabinet_snapshots
+                (owner_user_id, appointments, patients, doctor_profile, updated_at)
+              VALUES (?, '[]', '[]', '{}', ?)`,
+        args: [ownerUserId, now],
+      });
+
+      const cur = await db.execute({
+        sql: "SELECT extra_data FROM cabinet_snapshots WHERE owner_user_id = ?",
+        args: [ownerUserId],
+      });
+      const extra = cur.rows.length
+        ? JSON.parse(decryptField((cur.rows[0].extra_data as string) || "{}"))
+        : {};
+      const serverDocs: any[] = Array.isArray(extra.apptDocuments) ? extra.apptDocuments : [];
+      const serverIds = new Set(serverDocs.map((d: any) => d?.id).filter(Boolean));
+
+      let merged = [...serverDocs];
+      for (const doc of Array.isArray(documents) ? documents : []) {
+        if (doc && doc.id && !serverIds.has(doc.id)) merged.push(doc);
+      }
+      if (Array.isArray(deletedIds) && deletedIds.length > 0) {
+        const gone = new Set(deletedIds.filter((x: unknown) => typeof x === "string"));
+        merged = merged.filter((d: any) => !gone.has(d.id));
+      }
+
+      extra.apptDocuments = merged;
+      await db.execute({
+        sql: "UPDATE cabinet_snapshots SET extra_data = ?, updated_at = ? WHERE owner_user_id = ?",
+        args: [encryptField(JSON.stringify(extra)), now, ownerUserId],
+      });
+
+      return res.json({ success: true, updatedAt: now, apptDocuments: merged });
+    } catch (err: any) {
+      console.error("[CABINET] Appt-documents update error:", err.message);
       return res.status(500).json({ error: "Erreur lors de la mise à jour" });
     }
   },
