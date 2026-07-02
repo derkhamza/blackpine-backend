@@ -479,6 +479,9 @@ const SECRETARY_APPT_FIELDS = [
   // reduction she stamps come from the doctor's prepared bill).
   "billedItems", "billedReduction", "paidAmount", "payments",
   "preparedItems", "preparedReduction",
+  // Bilan clinique types added at the desk (the measurement VALUES ride in
+  // consultationNote.extraFields, merged separately key-by-key below).
+  "extraBilans",
   "mutuellePapersFilled", "mutuellePapersDate",
 ];
 const SECRETARY_PATIENT_FIELDS = [
