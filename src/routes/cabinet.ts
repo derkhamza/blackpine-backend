@@ -475,6 +475,10 @@ const SECRETARY_APPT_FIELDS = [
   // Moroccan secretaries take the measurements and handle billing at the desk.
   "vitalSigns",
   "billedAt", "billedAmount", "invoiceNumber", "invoiceIssuedAt",
+  // Itemized billing + payment tracking (the secretary encaisse; the items and
+  // reduction she stamps come from the doctor's prepared bill).
+  "billedItems", "billedReduction", "paidAmount", "payments",
+  "preparedItems", "preparedReduction",
   "mutuellePapersFilled", "mutuellePapersDate",
 ];
 const SECRETARY_PATIENT_FIELDS = [
@@ -551,7 +555,7 @@ router.post(
   async (req: Request, res: Response) => {
     try {
       const { ownerUserId } = (req as any).secretary;
-      const { appointments } = req.body;
+      const { appointments, deletedIds } = req.body;
       const db = getDb();
       const now = new Date().toISOString();
 
@@ -570,7 +574,15 @@ router.post(
         args: [ownerUserId],
       });
       const serverAppts = cur.rows.length ? JSON.parse(decryptField(cur.rows[0].appointments as string)) : [];
-      const merged = mergeSecretaryWrite(serverAppts, appointments ?? [], SECRETARY_APPT_FIELDS);
+      let merged = mergeSecretaryWrite(serverAppts, appointments ?? [], SECRETARY_APPT_FIELDS);
+
+      // Secretaries manage the schedule, so explicit appointment deletions are
+      // honoured — but only via this explicit id list (a stale/partial push can
+      // still never silently drop records).
+      if (Array.isArray(deletedIds) && deletedIds.length > 0) {
+        const gone = new Set(deletedIds.filter((x: unknown) => typeof x === "string"));
+        merged = merged.filter((a: any) => !gone.has(a.id));
+      }
 
       await db.execute({
         sql: "UPDATE cabinet_snapshots SET appointments = ?, updated_at = ? WHERE owner_user_id = ?",
