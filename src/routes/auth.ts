@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { getDb } from "../db/database";
 import { generateToken } from "../middleware/auth";
+import { consumeVerificationCode } from "./verify";
 import crypto from "crypto";
 const uuid = () => crypto.randomUUID();
 
@@ -9,13 +10,16 @@ const router = Router();
 
 router.post("/signup", async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, code } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ error: "Email et mot de passe requis" });
     }
     if (password.length < 6) {
       return res.status(400).json({ error: "Le mot de passe doit contenir au moins 6 caractères" });
+    }
+    if (!code) {
+      return res.status(400).json({ error: "Code de vérification requis" });
     }
 
     const db = getDb();
@@ -27,6 +31,12 @@ router.post("/signup", async (req: Request, res: Response) => {
 
     if (existing.rows.length > 0) {
       return res.status(409).json({ error: "Un compte existe déjà avec cet email" });
+    }
+
+    // Email must be verified: consume a valid, unexpired code for this address.
+    const verified = await consumeVerificationCode(email, code);
+    if (!verified) {
+      return res.status(400).json({ error: "Code de vérification incorrect ou expiré" });
     }
 
     const id = uuid();

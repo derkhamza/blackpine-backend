@@ -1,70 +1,101 @@
-import { Router } from "express";
-import { Resend } from "resend";
+import { Router, Request, Response } from "express";
+import { getDb } from "../db/database";
+import { sendVerificationCode } from "../email/emailService";
+import crypto from "crypto";
 
+const uuid = () => crypto.randomUUID();
 const generateCode = () => String(Math.floor(100000 + Math.random() * 900000));
-
-async function sendVerificationEmail(to: string, code: string): Promise<void> {
-  const resend = new Resend(process.env.RESEND_API_KEY);
-  await resend.emails.send({
-    from: "Blackpine Cabinet <onboarding@resend.dev>",
-    to,
-    subject: "Blackpine Cabinet — Code de vérification",
-    html: `<div style="font-family: Arial, sans-serif; max-width: 400px; margin: 0 auto; padding: 20px;">
-      <h2 style="color: #1A7F64; text-align: center;">BLACKPINE CABINET</h2>
-      <p style="text-align: center; color: #666;">Votre code de vérification :</p>
-      <div style="text-align: center; font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #1A7F64; padding: 20px; background: #E3F5EF; border-radius: 10px; margin: 20px 0;">
-        ${code}
-      </div>
-      <p style="text-align: center; color: #999; font-size: 12px;">Ce code expire dans 10 minutes.</p>
-    </div>`,
-  });
-}
 
 const router = Router();
 
-const verificationCodes = new Map<string, { code: string; expiresAt: number }>();
-
-router.post("/send-code", async (req, res) => {
+// POST /verify/send-code — send a signup verification code to an email.
+// Codes are stored in the DB (durable across serverless cold starts).
+router.post("/send-code", async (req: Request, res: Response) => {
   try {
-    const { email } = req.body;
+    const email = String(req.body?.email || "").toLowerCase().trim();
     if (!email) return res.status(400).json({ error: "Email requis" });
 
+    const db = getDb();
+
+    // Refuse to re-verify an address that already has an account, so the user is
+    // told to log in instead of walking through a signup that would 409 anyway.
+    const existing = await db.execute({
+      sql: "SELECT id FROM users WHERE email = ?",
+      args: [email],
+    });
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: "Un compte existe déjà avec cet email" });
+    }
+
     const code = generateCode();
-    verificationCodes.set(email.toLowerCase(), {
-      code,
-      expiresAt: Date.now() + 10 * 60 * 1000,
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    // Invalidate any previous pending codes for this email.
+    await db.execute({
+      sql: "UPDATE email_verifications SET used = 1 WHERE email = ? AND used = 0",
+      args: [email],
+    });
+    await db.execute({
+      sql: "INSERT INTO email_verifications (id, email, code, expires_at) VALUES (?, ?, ?, ?)",
+      args: [uuid(), email, code, expiresAt],
     });
 
-    await sendVerificationEmail(email, code);
+    await sendVerificationCode(email, code);
 
     res.json({ success: true });
   } catch (err: any) {
-    console.error("[VERIFY] Send code error:", err);
-    res.status(500).json({ error: err.message || "Erreur serveur" });
+    console.error("[VERIFY] Send code error:", err.message);
+    res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
-router.post("/check-code", async (req, res) => {
+// POST /verify/check-code — validate a code WITHOUT consuming it (instant UI
+// feedback). The authoritative consume happens in /auth/signup.
+router.post("/check-code", async (req: Request, res: Response) => {
   try {
-    const { email, code } = req.body;
+    const email = String(req.body?.email || "").toLowerCase().trim();
+    const code = String(req.body?.code || "").trim();
     if (!email || !code) return res.status(400).json({ error: "Email et code requis" });
 
-    const entry = verificationCodes.get(email.toLowerCase());
-    if (!entry) return res.status(400).json({ error: "Aucun code envoyé pour cet email" });
-    if (Date.now() > entry.expiresAt) {
-      verificationCodes.delete(email.toLowerCase());
-      return res.status(400).json({ error: "Code expiré. Demandez un nouveau code." });
-    }
-    if (entry.code !== code.trim()) {
-      return res.status(400).json({ error: "Code incorrect" });
-    }
+    const valid = await isVerificationCodeValid(email, code);
+    if (!valid) return res.status(400).json({ error: "Code incorrect ou expiré" });
 
-    verificationCodes.delete(email.toLowerCase());
     res.json({ verified: true });
   } catch (err: any) {
-    console.error("[VERIFY] Check code error:", err);
-    res.status(500).json({ error: err.message || "Erreur serveur" });
+    console.error("[VERIFY] Check code error:", err.message);
+    res.status(500).json({ error: "Erreur serveur" });
   }
 });
+
+// Shared helper: is there an unused, unexpired code matching this email?
+export async function isVerificationCodeValid(email: string, code: string): Promise<boolean> {
+  const db = getDb();
+  const result = await db.execute({
+    sql: "SELECT id, expires_at FROM email_verifications WHERE email = ? AND code = ? AND used = 0",
+    args: [email.toLowerCase().trim(), code.trim()],
+  });
+  if (result.rows.length === 0) return false;
+  const expiresAt = new Date(result.rows[0].expires_at as string);
+  return expiresAt >= new Date();
+}
+
+// Shared helper: consume (mark used) all pending codes for an email once signup
+// succeeds. Returns true if a valid code existed and was consumed.
+export async function consumeVerificationCode(email: string, code: string): Promise<boolean> {
+  const db = getDb();
+  const e = email.toLowerCase().trim();
+  const result = await db.execute({
+    sql: "SELECT id, expires_at FROM email_verifications WHERE email = ? AND code = ? AND used = 0",
+    args: [e, code.trim()],
+  });
+  if (result.rows.length === 0) return false;
+  const expiresAt = new Date(result.rows[0].expires_at as string);
+  if (expiresAt < new Date()) return false;
+  await db.execute({
+    sql: "UPDATE email_verifications SET used = 1 WHERE email = ?",
+    args: [e],
+  });
+  return true;
+}
 
 export default router;

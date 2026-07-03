@@ -56,6 +56,18 @@ export async function initDatabase(): Promise<void> {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- Signup email-verification codes. Keyed by email (the user does not exist
+    -- yet), durable so codes survive serverless cold starts between send + verify.
+    CREATE TABLE IF NOT EXISTS email_verifications (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      code TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_verifications_email ON email_verifications(email);
+
     CREATE TABLE IF NOT EXISTS activation_codes (
   code TEXT PRIMARY KEY,
   plan TEXT NOT NULL,
