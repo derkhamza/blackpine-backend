@@ -5,12 +5,12 @@ const FROM_EMAIL = process.env.FROM_EMAIL || "onboarding@resend.dev";
 
 export async function sendResetCode(to: string, code: string): Promise<void> {
   await resend.emails.send({
-    from: `Blackpine Cabinet <${FROM_EMAIL}>`,
+    from: `Blackpine <${FROM_EMAIL}>`,
     to,
-    subject: "Votre code de réinitialisation — Blackpine Cabinet",
+    subject: "Votre code de réinitialisation — Blackpine",
     html: `
       <div style="font-family: sans-serif; max-width: 400px; margin: 0 auto; padding: 32px;">
-        <h2 style="color: #1E3A2F; margin-bottom: 8px;">Blackpine Cabinet</h2>
+        <h2 style="color: #1E3A2F; margin-bottom: 8px;">Blackpine</h2>
         <p style="color: #666; font-size: 14px;">Votre code de réinitialisation :</p>
         <div style="background: #F5F4EF; padding: 20px; border-radius: 8px; text-align: center; margin: 24px 0;">
           <span style="font-size: 32px; font-weight: 700; letter-spacing: 8px; color: #1E3A2F;">${code}</span>
@@ -25,12 +25,12 @@ export async function sendResetCode(to: string, code: string): Promise<void> {
 
 export async function sendVerificationCode(to: string, code: string): Promise<void> {
   await resend.emails.send({
-    from: `Blackpine Cabinet <${FROM_EMAIL}>`,
+    from: `Blackpine <${FROM_EMAIL}>`,
     to,
-    subject: "Votre code de vérification — Blackpine Cabinet",
+    subject: "Votre code de vérification — Blackpine",
     html: `
       <div style="font-family: sans-serif; max-width: 400px; margin: 0 auto; padding: 32px;">
-        <h2 style="color: #1E3A2F; margin-bottom: 8px;">Blackpine Cabinet</h2>
+        <h2 style="color: #1E3A2F; margin-bottom: 8px;">Blackpine</h2>
         <p style="color: #666; font-size: 14px;">Confirmez votre adresse email avec ce code :</p>
         <div style="background: #F5F4EF; padding: 20px; border-radius: 8px; text-align: center; margin: 24px 0;">
           <span style="font-size: 32px; font-weight: 700; letter-spacing: 8px; color: #1E3A2F;">${code}</span>
@@ -47,7 +47,7 @@ export async function sendEmail(to: string, subject: string, html: string): Prom
   const { Resend } = require("resend");
   const resend = new Resend(process.env.RESEND_API_KEY);
   await resend.emails.send({
-    from: "Blackpine Cabinet <onboarding@resend.dev>",
+    from: "Blackpine <onboarding@resend.dev>",
     to,
     subject,
     html,
