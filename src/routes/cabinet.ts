@@ -584,23 +584,29 @@ router.post(
       const serverAppts = cur.rows.length ? JSON.parse(decryptField(cur.rows[0].appointments as string)) : [];
       let merged = mergeSecretaryWrite(serverAppts, appointments ?? [], SECRETARY_APPT_FIELDS);
 
-      // Secretaries take measurements: accept consultationNote.extraFields
-      // (bilan clinique spécialisé / specialty measurement fields) key-by-key,
-      // while every other part of the clinical note (motif, examen, diagnostic,
-      // traitement) stays exactly as the doctor wrote it on the server.
+      // Secretaries take measurements and record the reason for visit at the
+      // desk: accept consultationNote.extraFields (bilan clinique spécialisé /
+      // specialty measurement fields) key-by-key AND consultationNote.motif,
+      // while the rest of the clinical note (examen, diagnostic, traitement)
+      // stays exactly as the doctor wrote it on the server.
       const incApptById = new Map<string, any>(
         (appointments ?? []).filter((x: any) => x && x.id).map((x: any) => [x.id, x]),
       );
       merged = merged.map((a: any) => {
         const inc = incApptById.get(a.id);
-        const incExtra = inc?.consultationNote?.extraFields;
-        if (!incExtra || typeof incExtra !== "object") return a;
+        const incNote = inc?.consultationNote;
+        if (!incNote || typeof incNote !== "object") return a;
+        const incExtra = incNote.extraFields;
+        const hasExtra = incExtra && typeof incExtra === "object";
+        const hasMotif = typeof incNote.motif === "string"; // reason for visit, recorded at check-in
+        if (!hasExtra && !hasMotif) return a;
         const srvNote = a.consultationNote ?? {};
         return {
           ...a,
           consultationNote: {
             ...srvNote,
-            extraFields: { ...(srvNote.extraFields ?? {}), ...incExtra },
+            ...(hasMotif ? { motif: incNote.motif || undefined } : {}),
+            ...(hasExtra ? { extraFields: { ...(srvNote.extraFields ?? {}), ...incExtra } } : {}),
           },
         };
       });
