@@ -485,7 +485,7 @@ const SECRETARY_APPT_FIELDS = [
   "mutuellePapersFilled", "mutuellePapersDate",
 ];
 const SECRETARY_PATIENT_FIELDS = [
-  "firstName", "lastName", "phone", "email", "address", "city",
+  "firstName", "lastName", "arabicName", "phone", "email", "address", "city",
   "dob", "gender", "cin", "cnops", "mutuelle",
 ];
 
