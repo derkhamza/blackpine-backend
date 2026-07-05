@@ -3,8 +3,19 @@ import { getDb } from "../db/database";
 
 const TRIAL_DAYS = 30;
 
+// Product owner / operators are never subject to the app's own trial.
+function isOwnerEmail(email: string | undefined): boolean {
+  const admins = (process.env.ADMIN_EMAILS || "derkhamza@gmail.com")
+    .toLowerCase().split(",").map(s => s.trim()).filter(Boolean);
+  return !!email && admins.includes(email.toLowerCase());
+}
+
 export async function subscriptionRequired(req: Request, res: Response, next: NextFunction) {
   try {
+    // Owner/admin accounts bypass the gate entirely (they use the app as normal
+    // doctors and must never be locked out of their own product).
+    if (isOwnerEmail((req as any).user?.email)) return next();
+
     // Gate on the ACCOUNT OWNER: a doctor authenticates as req.user; a secretary
     // authenticates as req.secretary and acts on the owning doctor's cabinet, so
     // her writes are governed by that doctor's subscription.
