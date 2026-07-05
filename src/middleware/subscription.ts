@@ -5,11 +5,15 @@ const TRIAL_DAYS = 30;
 
 export async function subscriptionRequired(req: Request, res: Response, next: NextFunction) {
   try {
-    const user = (req as any).user;
+    // Gate on the ACCOUNT OWNER: a doctor authenticates as req.user; a secretary
+    // authenticates as req.secretary and acts on the owning doctor's cabinet, so
+    // her writes are governed by that doctor's subscription.
+    const userId = (req as any).user?.userId ?? (req as any).secretary?.ownerUserId;
+    if (!userId) return next(); // no identity resolved (auth already ran) — don't block
     const db = getDb();
     const result = await db.execute({
       sql: "SELECT trial_start, subscription_plan, subscription_expires_at FROM users WHERE id = ?",
-      args: [user.userId],
+      args: [userId],
     });
 
     if (result.rows.length === 0) return res.status(401).json({ error: "Utilisateur non trouvé" });
@@ -34,7 +38,7 @@ export async function subscriptionRequired(req: Request, res: Response, next: Ne
       try {
         await db.execute({
           sql: "UPDATE users SET trial_start = ? WHERE id = ?",
-          args: [trialStart, user.userId],
+          args: [trialStart, userId],
         });
       } catch (updateErr: any) {
         console.error("[SUBSCRIPTION] Failed to backfill trial_start:", updateErr.message);

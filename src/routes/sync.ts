@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../db/database";
 import { encryptField, decryptField } from "../crypto/dataCipher";
+import { subscriptionRequired } from "../middleware/subscription";
 
 const router = Router();
 
@@ -59,7 +60,7 @@ router.get("/pull", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/push", async (req: Request, res: Response) => {
+router.post("/push", subscriptionRequired, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
     const { profile, transactions, assets, recurringRules } = req.body;

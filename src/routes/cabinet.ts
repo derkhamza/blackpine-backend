@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getDb } from "../db/database";
 import { authRequired } from "../middleware/auth";
+import { subscriptionRequired } from "../middleware/subscription";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import type { Client } from "@libsql/client";
@@ -255,7 +256,7 @@ router.get("/terms", (_req: Request, res: Response) => {
 // ── Doctor routes ────────────────────────────────────────────────────────────
 
 // POST /cabinet/push — doctor pushes a full snapshot
-router.post("/push", authRequired, async (req: Request, res: Response) => {
+router.post("/push", authRequired, subscriptionRequired, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
     const {
@@ -371,7 +372,7 @@ router.get("/backups", authRequired, async (req: Request, res: Response) => {
 });
 
 // POST /cabinet/restore — restore a backup into the live snapshot
-router.post("/restore", authRequired, async (req: Request, res: Response) => {
+router.post("/restore", authRequired, subscriptionRequired, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
     const { backupId } = req.body;
@@ -560,6 +561,7 @@ router.get("/pull", secretaryAuthRequired, async (req: Request, res: Response) =
 router.post(
   "/appointments",
   secretaryAuthRequired,
+  subscriptionRequired,
   async (req: Request, res: Response) => {
     try {
       const { ownerUserId } = (req as any).secretary;
@@ -641,6 +643,7 @@ router.post(
 router.post(
   "/appt-documents",
   secretaryAuthRequired,
+  subscriptionRequired,
   async (req: Request, res: Response) => {
     try {
       const { ownerUserId } = (req as any).secretary;
@@ -692,6 +695,7 @@ router.post(
 router.post(
   "/patients",
   secretaryAuthRequired,
+  subscriptionRequired,
   async (req: Request, res: Response) => {
     try {
       const { ownerUserId } = (req as any).secretary;
