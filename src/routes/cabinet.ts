@@ -488,6 +488,8 @@ const SECRETARY_APPT_FIELDS = [
 const SECRETARY_PATIENT_FIELDS = [
   "firstName", "lastName", "arabicName", "phone", "email", "address", "city",
   "dob", "gender", "cin", "cnops", "mutuelle",
+  // The secretary records the patient's current treatment at check-in.
+  "currentMedications",
 ];
 
 function mergeSecretaryWrite(
