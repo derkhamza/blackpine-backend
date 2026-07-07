@@ -481,8 +481,9 @@ const SECRETARY_APPT_FIELDS = [
   "billedItems", "billedReduction", "paidAmount", "payments",
   "preparedItems", "preparedReduction",
   // Bilan clinique types added at the desk (the measurement VALUES ride in
-  // consultationNote.extraFields, merged separately key-by-key below).
-  "extraBilans",
+  // consultationNote.extraFields, merged separately key-by-key below). The
+  // secretary can also place a group in a section and add free-form measures.
+  "extraBilans", "bilanSource", "customMeasures",
   "mutuellePapersFilled", "mutuellePapersDate",
 ];
 const SECRETARY_PATIENT_FIELDS = [
