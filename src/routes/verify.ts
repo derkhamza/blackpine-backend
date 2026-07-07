@@ -35,12 +35,25 @@ router.post("/send-code", async (req: Request, res: Response) => {
       sql: "UPDATE email_verifications SET used = 1 WHERE email = ? AND used = 0",
       args: [email],
     });
+    const rowId = uuid();
     await db.execute({
       sql: "INSERT INTO email_verifications (id, email, code, expires_at) VALUES (?, ?, ?, ?)",
-      args: [uuid(), email, code, expiresAt],
+      args: [rowId, email, code, expiresAt],
     });
 
-    await sendVerificationCode(email, code);
+    // Send the mail. If the provider rejects it (unverified domain, bad key,
+    // test-mode recipient limit…) surface a clear, email-specific error rather
+    // than a generic 500 — and drop the just-inserted code so it can't be used.
+    try {
+      await sendVerificationCode(email, code);
+    } catch (mailErr: any) {
+      console.error("[VERIFY] Verification email could not be sent:", mailErr.message);
+      await db.execute({
+        sql: "UPDATE email_verifications SET used = 1 WHERE id = ?",
+        args: [rowId],
+      });
+      return res.status(502).json({ error: "L'email de vérification n'a pas pu être envoyé. Réessayez dans un instant." });
+    }
 
     res.json({ success: true });
   } catch (err: any) {
