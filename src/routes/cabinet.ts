@@ -486,9 +486,15 @@ const SECRETARY_APPT_FIELDS = [
   "extraBilans", "bilanSource", "customMeasures",
   "mutuellePapersFilled", "mutuellePapersDate",
 ];
+// Field names MUST match the canonical Patient schema (web cabinetTypes.ts /
+// the shared snapshot) exactly — a name the client never sends (e.g. "dob"
+// instead of "dateOfBirth") silently drops the secretary's edit on merge, so
+// the value reverts a couple seconds after they type it.
 const SECRETARY_PATIENT_FIELDS = [
   "firstName", "lastName", "arabicName", "phone", "email", "address", "city",
-  "dob", "gender", "cin", "cnops", "mutuelle",
+  "dateOfBirth", "gender", "cin", "cnopsNumber", "mutuelle",
+  // Patient-desk fields the secretary edits in the patient form.
+  "bloodType", "allergies", "antecedents", "notes",
   // The secretary records the patient's current treatment at check-in.
   "currentMedications",
 ];
