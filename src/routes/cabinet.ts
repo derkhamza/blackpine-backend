@@ -17,6 +17,13 @@ function snapshotEtag(updatedAt: string | null | undefined): string {
   return `"cab-${Buffer.from(String(updatedAt ?? "0")).toString("base64url")}"`;
 }
 
+// A content hash of the appointment attachments, used to skip re-sending the
+// (heavy) base64 blobs on a pull when the client already holds the current set.
+// Hashing a few MB is milliseconds and only runs on the non-304 path.
+function apptDocsVersion(docs: unknown[]): string {
+  return crypto.createHash("sha1").update(JSON.stringify(docs ?? [])).digest("base64url");
+}
+
 // ── Automatic backups ─────────────────────────────────────────────────────────
 // Keep a rolling history of daily snapshots so a doctor can recover from an
 // accidental deletion or corruption that normal sync would otherwise propagate.
@@ -469,13 +476,25 @@ router.get("/my", authRequired, async (req: Request, res: Response) => {
 
     const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
 
-    return res.json({
+    // Attachments (base64 scans/PDFs) are the heaviest part of the snapshot but
+    // rarely change, so don't re-send them just because an appointment or
+    // patient changed. Version them separately; include the bytes only when the
+    // client's version is stale. The client leaves its copy untouched when the
+    // field is absent, so omission = "you already have the current files".
+    const { apptDocuments: docs, ...restExtra } = extra;
+    const docsArr = Array.isArray(docs) ? docs : [];
+    const docsVer = apptDocsVersion(docsArr);
+
+    const body: any = {
       appointments:          JSON.parse(decryptField(row.appointments as string)),
       patients:              JSON.parse(decryptField(row.patients as string)),
       doctorProfile:         JSON.parse(decryptField(row.doctor_profile as string)),
       updatedAt:             row.updated_at,
-      ...extra,
-    });
+      apptDocumentsVersion:  docsVer,
+      ...restExtra,
+    };
+    if (String(req.query.docsVersion || "") !== docsVer) body.apptDocuments = docsArr;
+    return res.json(body);
   } catch (err: any) {
     console.error("[CABINET] My pull error:", err.message);
     return res.status(500).json({ error: "Erreur lors de la récupération" });
@@ -580,15 +599,20 @@ router.get("/pull", secretaryAuthRequired, async (req: Request, res: Response) =
     }
 
     const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
-    return res.json({
+    const docsArr = Array.isArray(extra.apptDocuments) ? extra.apptDocuments : [];
+    const docsVer = apptDocsVersion(docsArr);
+    const body: any = {
       appointments: JSON.parse(decryptField(row.appointments as string)),
       patients: JSON.parse(decryptField(row.patients as string)),
       doctorProfile: JSON.parse(decryptField(row.doctor_profile as string)),
-      // Appointment attachments: the desk attaches analyses / mutuelle forms /
-      // scans, so the secretary sees and adds them (no other extra collection
-      // is exposed to secretary sessions).
-      apptDocuments: Array.isArray(extra.apptDocuments) ? extra.apptDocuments : [],
-    });
+      apptDocumentsVersion: docsVer,
+    };
+    // Appointment attachments: the desk attaches analyses / mutuelle forms /
+    // scans, so the secretary sees and adds them (no other extra collection is
+    // exposed to secretary sessions). Sent only when the client's version is
+    // stale — omission means "keep the copy you already have".
+    if (String(req.query.docsVersion || "") !== docsVer) body.apptDocuments = docsArr;
+    return res.json(body);
   } catch (err: any) {
     console.error("[CABINET] Pull error:", err.message);
     return res.status(500).json({ error: "Erreur lors de la récupération" });
