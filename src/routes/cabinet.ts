@@ -10,6 +10,13 @@ import { encryptField, decryptField } from "./../crypto/dataCipher";
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || "blackpine-dev-secret-change-in-production";
 
+// A snapshot's version is its updated_at; derive a stable ETag from it so pulls
+// can be answered with 304 Not Modified when nothing has changed. Every write
+// path bumps updated_at, so any change (doctor or secretary) busts the tag.
+function snapshotEtag(updatedAt: string | null | undefined): string {
+  return `"cab-${Buffer.from(String(updatedAt ?? "0")).toString("base64url")}"`;
+}
+
 // ── Automatic backups ─────────────────────────────────────────────────────────
 // Keep a rolling history of daily snapshots so a doctor can recover from an
 // accidental deletion or corruption that normal sync would otherwise propagate.
@@ -448,6 +455,18 @@ router.get("/my", authRequired, async (req: Request, res: Response) => {
     }
 
     const row = result.rows[0];
+
+    // Conditional GET: the whole (potentially multi-MB, attachment-laden)
+    // snapshot is re-polled every few seconds but changes rarely. Tag it by
+    // updated_at and answer an unchanged poll with a bodyless 304 — this is the
+    // single biggest cut to Fast Origin Transfer.
+    const etag = snapshotEtag(row.updated_at as string);
+    res.setHeader("ETag", etag);
+    res.setHeader("Cache-Control", "private, no-cache");
+    if (req.headers["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
+
     const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
 
     return res.json({
@@ -541,7 +560,7 @@ router.get("/pull", secretaryAuthRequired, async (req: Request, res: Response) =
     const db = getDb();
 
     const result = await db.execute({
-      sql: "SELECT appointments, patients, doctor_profile, extra_data FROM cabinet_snapshots WHERE owner_user_id = ?",
+      sql: "SELECT appointments, patients, doctor_profile, extra_data, updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
       args: [ownerUserId],
     });
 
@@ -550,6 +569,16 @@ router.get("/pull", secretaryAuthRequired, async (req: Request, res: Response) =
     }
 
     const row = result.rows[0];
+
+    // Conditional GET — see /cabinet/my. The desk re-polls the same snapshot on
+    // a timer; answer unchanged polls with a bodyless 304.
+    const etag = snapshotEtag(row.updated_at as string);
+    res.setHeader("ETag", etag);
+    res.setHeader("Cache-Control", "private, no-cache");
+    if (req.headers["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
+
     const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
     return res.json({
       appointments: JSON.parse(decryptField(row.appointments as string)),

@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import compression from "compression";
 import { initDatabase } from "../src/db/database";
 import authRoutes from "../src/routes/auth";
 import syncRoutes from "../src/routes/sync";
@@ -25,7 +26,13 @@ import { isCipherActive } from "../src/crypto/dataCipher";
 
 const app = express();
 
-app.use(cors());
+// gzip/brotli every response big enough to matter. The sync pulls are large
+// JSON payloads, so this is a major cut in Fast Origin Transfer (bytes served
+// out of the function) — the metric that got the project disabled.
+app.use(compression());
+// exposedHeaders: the web app is a different origin, so the browser only lets
+// JS read the ETag (needed for conditional sync pulls) if we expose it.
+app.use(cors({ exposedHeaders: ["ETag"] }));
 app.use(express.json({ limit: "20mb" }));
 
 app.use("/auth", rateLimit(10, 15 * 60 * 1000), authRoutes);
