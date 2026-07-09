@@ -32,7 +32,10 @@ const app = express();
 app.use(compression());
 // exposedHeaders: the web app is a different origin, so the browser only lets
 // JS read the ETag (needed for conditional sync pulls) if we expose it.
-app.use(cors({ exposedHeaders: ["ETag"] }));
+// maxAge: Bearer auth forces a CORS preflight OPTIONS before every API call;
+// caching it (browsers cap ~2–24h) removes that second request+invocation on
+// every poll/push — a large cut to Edge Requests and Function Invocations.
+app.use(cors({ exposedHeaders: ["ETag"], maxAge: 86400 }));
 app.use(express.json({ limit: "20mb" }));
 
 app.use("/auth", rateLimit(10, 15 * 60 * 1000), authRoutes);

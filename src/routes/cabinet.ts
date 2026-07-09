@@ -452,27 +452,36 @@ router.get("/my", authRequired, async (req: Request, res: Response) => {
     const userId = (req as any).user.userId;
     const db = getDb();
 
-    const result = await db.execute({
-      sql: "SELECT appointments, patients, doctor_profile, extra_data, updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
+    // Light conditional-GET path: read ONLY updated_at first so an unchanged
+    // poll (the overwhelming majority) never drags the multi-MB encrypted
+    // snapshot out of Turso just to be discarded. Tag by updated_at and answer
+    // with a bodyless 304 — cuts function duration + DB egress on the hot path.
+    const verRow = await db.execute({
+      sql: "SELECT updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
       args: [userId],
     });
-
-    if (result.rows.length === 0) {
+    if (verRow.rows.length === 0) {
       return res.json(null); // no snapshot yet
     }
-
-    const row = result.rows[0];
-
-    // Conditional GET: the whole (potentially multi-MB, attachment-laden)
-    // snapshot is re-polled every few seconds but changes rarely. Tag it by
-    // updated_at and answer an unchanged poll with a bodyless 304 — this is the
-    // single biggest cut to Fast Origin Transfer.
-    const etag = snapshotEtag(row.updated_at as string);
+    const etag = snapshotEtag(verRow.rows[0].updated_at as string);
     res.setHeader("ETag", etag);
     res.setHeader("Cache-Control", "private, no-cache");
     if (req.headers["if-none-match"] === etag) {
       return res.status(304).end();
     }
+
+    // Changed → now fetch the full row.
+    const result = await db.execute({
+      sql: "SELECT appointments, patients, doctor_profile, extra_data, updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
+      args: [userId],
+    });
+    if (result.rows.length === 0) {
+      return res.json(null); // deleted between the two reads
+    }
+    const row = result.rows[0];
+    // Re-tag from the full row so the client's stored ETag matches the body it
+    // actually received (guards the rare change-between-reads race).
+    res.setHeader("ETag", snapshotEtag(row.updated_at as string));
 
     const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
 
@@ -578,25 +587,32 @@ router.get("/pull", secretaryAuthRequired, async (req: Request, res: Response) =
     const { ownerUserId } = (req as any).secretary;
     const db = getDb();
 
-    const result = await db.execute({
-      sql: "SELECT appointments, patients, doctor_profile, extra_data, updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
+    // Light conditional-GET path — see /cabinet/my. Read updated_at first so an
+    // unchanged desk poll never pulls the full encrypted snapshot from Turso.
+    const verRow = await db.execute({
+      sql: "SELECT updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
       args: [ownerUserId],
     });
-
-    if (result.rows.length === 0) {
+    if (verRow.rows.length === 0) {
       return res.json({ appointments: [], patients: [], doctorProfile: {}, apptDocuments: [] });
     }
-
-    const row = result.rows[0];
-
-    // Conditional GET — see /cabinet/my. The desk re-polls the same snapshot on
-    // a timer; answer unchanged polls with a bodyless 304.
-    const etag = snapshotEtag(row.updated_at as string);
+    const etag = snapshotEtag(verRow.rows[0].updated_at as string);
     res.setHeader("ETag", etag);
     res.setHeader("Cache-Control", "private, no-cache");
     if (req.headers["if-none-match"] === etag) {
       return res.status(304).end();
     }
+
+    // Changed → fetch the full row.
+    const result = await db.execute({
+      sql: "SELECT appointments, patients, doctor_profile, extra_data, updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
+      args: [ownerUserId],
+    });
+    if (result.rows.length === 0) {
+      return res.json({ appointments: [], patients: [], doctorProfile: {}, apptDocuments: [] });
+    }
+    const row = result.rows[0];
+    res.setHeader("ETag", snapshotEtag(row.updated_at as string));
 
     const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
     const docsArr = Array.isArray(extra.apptDocuments) ? extra.apptDocuments : [];
