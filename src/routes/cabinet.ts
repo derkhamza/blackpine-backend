@@ -465,7 +465,7 @@ router.get("/my", authRequired, async (req: Request, res: Response) => {
     }
     const etag = snapshotEtag(verRow.rows[0].updated_at as string);
     res.setHeader("ETag", etag);
-    res.setHeader("Cache-Control", "private, no-cache");
+    // Cache-Control is set globally to no-store (per-user data — see api/index.ts).
     if (req.headers["if-none-match"] === etag) {
       return res.status(304).end();
     }
@@ -600,7 +600,7 @@ router.get("/pull", secretaryAuthRequired, async (req: Request, res: Response) =
     }
     const etag = snapshotEtag(verRow.rows[0].updated_at as string);
     res.setHeader("ETag", etag);
-    res.setHeader("Cache-Control", "private, no-cache");
+    // Cache-Control is set globally to no-store (per-user data — see api/index.ts).
     if (req.headers["if-none-match"] === etag) {
       return res.status(304).end();
     }

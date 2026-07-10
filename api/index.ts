@@ -36,6 +36,18 @@ app.use(compression());
 // caching it (browsers cap ~2–24h) removes that second request+invocation on
 // every poll/push — a large cut to Edge Requests and Function Invocations.
 app.use(cors({ exposedHeaders: ["ETag"], maxAge: 86400 }));
+
+// Every response here is per-user (keyed by the Bearer token, not the URL).
+// Without this a browser or CDN could reuse ONE account's cached GET for a
+// DIFFERENT account on the same machine — showing "another account's data".
+// no-store defeats caching entirely; Vary: Authorization is belt-and-suspenders
+// for any intermediary. Our conditional sync pulls still work: the client sends
+// If-None-Match explicitly, so 304s are unaffected by no-store.
+app.use((_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Vary", "Authorization");
+  next();
+});
 app.use(express.json({ limit: "20mb" }));
 
 app.use("/auth", rateLimit(10, 15 * 60 * 1000), authRoutes);
