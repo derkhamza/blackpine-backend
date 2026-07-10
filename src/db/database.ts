@@ -2,6 +2,10 @@ import { createClient, Client } from "@libsql/client";
 
 let db: Client;
 
+// Bump this whenever the CREATE/ALTER sweep below changes (new table or column),
+// so existing databases re-run the setup once instead of skipping it forever.
+const SCHEMA_VERSION = 1;
+
 export function getDb(): Client {
   if (!db) {
     throw new Error("Database not initialized. Call initDatabase() first.");
@@ -21,6 +25,17 @@ export async function initDatabase(): Promise<void> {
     url,
     authToken,
   });
+
+  // Fast path: once the DB is at the current schema version, skip the ~40
+  // round-trip CREATE/ALTER sweep below. That sweep ran on EVERY serverless cold
+  // start and added ~10-15s — past the client's timeout — which surfaced to
+  // users as reset / sync / login "not working" once the function had gone idle.
+  try {
+    const r = await db.execute("SELECT version FROM schema_meta WHERE id = 1");
+    if (r.rows.length && Number(r.rows[0].version) >= SCHEMA_VERSION) {
+      return;
+    }
+  } catch { /* schema_meta absent → first boot on this DB; run the full setup */ }
 
   // Create tables
   await db.executeMultiple(`
@@ -214,5 +229,12 @@ export async function initDatabase(): Promise<void> {
     try { await db.execute("ALTER TABLE cabinet_snapshots ADD COLUMN extra_data TEXT DEFAULT '{}'"); } catch {}
     // Link account-based secretary logins to their account so the doctor can revoke them.
     try { await db.execute("ALTER TABLE secretary_sessions ADD COLUMN account_id TEXT"); } catch {}
-  console.log("[DB] Connected to Turso database");
+
+  // Record the schema version so subsequent cold starts take the fast path.
+  await db.executeMultiple(`
+    CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+    INSERT INTO schema_meta (id, version) VALUES (1, ${SCHEMA_VERSION})
+      ON CONFLICT(id) DO UPDATE SET version = ${SCHEMA_VERSION};
+  `);
+  console.log("[DB] Schema ensured (version " + SCHEMA_VERSION + ")");
 }
