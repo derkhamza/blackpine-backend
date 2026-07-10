@@ -531,7 +531,9 @@ const SECRETARY_APPT_FIELDS = [
   // consultationNote.extraFields, merged separately key-by-key below). The
   // secretary can also place a group in a section and add free-form measures.
   "extraBilans", "bilanSource", "customMeasures",
-  "mutuellePapersFilled", "mutuellePapersDate",
+  // AMO / mutuelle paperwork + follow-up date — the secretary manages the
+  // Suivi & AMO tab (paperwork, encaissement, next-visit scheduling).
+  "mutuellePapersFilled", "mutuellePapersDate", "followUpDate",
 ];
 // Field names MUST match the canonical Patient schema (web cabinetTypes.ts /
 // the shared snapshot) exactly — a name the client never sends (e.g. "dob"
