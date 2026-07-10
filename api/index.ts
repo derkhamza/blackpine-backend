@@ -84,14 +84,52 @@ app.use("/account", rateLimit(10, 15 * 60 * 1000), authRequired, accountRoutes);
 // fails (transient Turso hiccup), reset so the next request can retry cleanly.
 let initPromise: Promise<void> | null = null;
 
+// Hard ceiling on how long a request will wait for the DB to come up. Without
+// it, an unresponsive Turso makes initDatabase() hang until Vercel's 300s
+// function timeout — so EVERY request (even /health and CORS preflights, which
+// don't need the DB) 504s and the function's keep-warm pings pile up. The
+// normal cold-start path is a single ~1s SELECT (schema_meta fast-path), so a
+// generous timeout never trips in healthy operation.
+const DB_INIT_TIMEOUT_MS = 15_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("DB_INIT_TIMEOUT")), ms);
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 const handler = async (req: any, res: any) => {
+  // Health checks and CORS preflights must NEVER wait on the database: the
+  // uptime monitor keeps the function warm, and the browser preflights every
+  // authenticated call. Serve them straight from the app (cors + /health touch
+  // no DB) so a slow/unavailable Turso can't take the whole API down.
+  const url: string = req.url || "";
+  if (req.method === "OPTIONS" || url === "/health" || url.startsWith("/health?")) {
+    return app(req, res);
+  }
+
   if (!initPromise) {
     initPromise = initDatabase().catch((err) => {
       initPromise = null; // allow a fresh attempt on the next request
       throw err;
     });
   }
-  await initPromise;
+  try {
+    await withTimeout(initPromise, DB_INIT_TIMEOUT_MS);
+  } catch (err: any) {
+    // Fail fast with a clear 503 instead of hanging for 300s. The client's
+    // retry (and the next request) will re-attempt once Turso responds again.
+    if (err?.message === "DB_INIT_TIMEOUT") initPromise = null; // don't cache a hung attempt
+    console.error("[INIT] Database unavailable:", err?.message || err);
+    res.statusCode = 503;
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Retry-After", "5");
+    return res.end(JSON.stringify({ error: "database_unavailable" }));
+  }
   return app(req, res);
 };
 
