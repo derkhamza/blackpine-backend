@@ -45,31 +45,26 @@ export async function initDatabase(): Promise<void> {
   // can't hang on a handshake and never exhausts a connection pool. Turso serves
   // both schemes on the same host, so this is a safe swap.
   const httpUrl = url.replace(/^libsql:\/\//i, "https://");
+  db = createClient({ url: httpUrl, authToken });
 
-  const PROBE_TIMEOUT_MS = 4000;
-  const PROBE_ATTEMPTS = 3;
-  for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
-    db = createClient({ url: httpUrl, authToken });
-    try {
-      const r = await dbTimeout(
-        db.execute("SELECT version FROM schema_meta WHERE id = 1"),
-        PROBE_TIMEOUT_MS,
-        "DB_PROBE_TIMEOUT",
-      );
-      // Connected. If the schema is current we're done; otherwise fall through
-      // to the one-time setup sweep below.
-      if (r.rows.length && Number(r.rows[0].version) >= SCHEMA_VERSION) return;
-      break;
-    } catch (e: any) {
-      if (e?.message === "DB_PROBE_TIMEOUT") {
-        // Connection hung — try again with a brand-new client.
-        if (attempt < PROBE_ATTEMPTS) continue;
-        throw e; // exhausted retries → handler returns a fast 503
-      }
-      // A real SQL error (schema_meta table absent on first boot) means we ARE
-      // connected — proceed to the full setup below.
-      break;
-    }
+  // Give the cold connection ONE generous window (12s) rather than several short
+  // ones: a cold lambda's first request to Turso can take several seconds to
+  // establish, and aborting it every few seconds only guarantees failure. If it
+  // still hasn't answered in 12s the DB is genuinely unreachable → let the
+  // handler return a fast 503 (well under the client's 20s timeout).
+  try {
+    const r = await dbTimeout(
+      db.execute("SELECT version FROM schema_meta WHERE id = 1"),
+      12_000,
+      "DB_PROBE_TIMEOUT",
+    );
+    // Connected. If the schema is current we're done; otherwise fall through to
+    // the one-time setup sweep below.
+    if (r.rows.length && Number(r.rows[0].version) >= SCHEMA_VERSION) return;
+  } catch (e: any) {
+    if (e?.message === "DB_PROBE_TIMEOUT") throw e; // unreachable → fast 503
+    // A real SQL error (schema_meta absent on first boot) means we ARE connected
+    // — proceed to the full setup below.
   }
 
   // Create tables

@@ -112,6 +112,13 @@ const handler = async (req: any, res: any) => {
   // no DB) so a slow/unavailable Turso can't take the whole API down.
   const url: string = req.url || "";
   if (req.method === "OPTIONS" || url === "/health" || url.startsWith("/health?")) {
+    // Warm the DB connection in the BACKGROUND on health pings (the uptime
+    // monitor hits /health every ~5 min). Once an instance has a live DB
+    // connection, real requests on it skip the cold connect and are instant.
+    // Fire-and-forget — never await — so /health stays fast and DB-independent.
+    if (url.startsWith("/health") && !initPromise) {
+      initPromise = initDatabase().catch(() => { initPromise = null; });
+    }
     return app(req, res);
   }
 
