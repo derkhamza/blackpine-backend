@@ -50,9 +50,12 @@ app.use((_req, res, next) => {
 });
 app.use(express.json({ limit: "20mb" }));
 
-app.use("/auth", rateLimit(10, 15 * 60 * 1000), authRoutes);
-app.use("/reset", rateLimit(5, 15 * 60 * 1000), resetRoutes);
-app.use("/verify", rateLimit(5, 10 * 60 * 1000), verifyRouter);
+// Now keyed on the real client IP (see rateLimit). Limits are per-IP; a clinic
+// behind one NAT shares an IP and the web client auto-retries, so keep /auth
+// generous enough not to lock out a legitimate desk.
+app.use("/auth", rateLimit(30, 15 * 60 * 1000), authRoutes);
+app.use("/reset", rateLimit(8, 15 * 60 * 1000), resetRoutes);
+app.use("/verify", rateLimit(10, 10 * 60 * 1000), verifyRouter);
 app.use("/subscription", rateLimit(10, 15 * 60 * 1000), subscriptionRouter);
 app.use("/ocr-proxy", ocrProxyRouter);
 
