@@ -38,10 +38,18 @@ export async function initDatabase(): Promise<void> {
   // with a short per-attempt timeout and retry on a NEW client before giving up
   // — this turns most would-be connection hangs into a fast success instead of a
   // "database unavailable" / "connexion trop lente" error at the desk.
+  // Force HTTP mode: a `libsql://` URL makes @libsql/client open a persistent
+  // WebSocket (hrana) connection, whose handshake can hang for 15s+ on a cold
+  // serverless lambda and holds a connection slot. `https://` uses stateless
+  // per-query HTTP requests — the mode Turso recommends for serverless — which
+  // can't hang on a handshake and never exhausts a connection pool. Turso serves
+  // both schemes on the same host, so this is a safe swap.
+  const httpUrl = url.replace(/^libsql:\/\//i, "https://");
+
   const PROBE_TIMEOUT_MS = 4000;
   const PROBE_ATTEMPTS = 3;
   for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
-    db = createClient({ url, authToken });
+    db = createClient({ url: httpUrl, authToken });
     try {
       const r = await dbTimeout(
         db.execute("SELECT version FROM schema_meta WHERE id = 1"),
