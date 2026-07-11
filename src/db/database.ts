@@ -13,6 +13,14 @@ export function getDb(): Client {
   return db;
 }
 
+// Reject a promise after `ms` so a hung Turso connection doesn't stall forever.
+function dbTimeout<T>(p: Promise<T>, ms: number, tag: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(tag)), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
 export async function initDatabase(): Promise<void> {
   const url = process.env.TURSO_DATABASE_URL;
   const authToken = process.env.TURSO_AUTH_TOKEN;
@@ -21,21 +29,40 @@ export async function initDatabase(): Promise<void> {
     throw new Error("TURSO_DATABASE_URL environment variable is required");
   }
 
-  db = createClient({
-    url,
-    authToken,
-  });
-
   // Fast path: once the DB is at the current schema version, skip the ~40
   // round-trip CREATE/ALTER sweep below. That sweep ran on EVERY serverless cold
-  // start and added ~10-15s — past the client's timeout — which surfaced to
-  // users as reset / sync / login "not working" once the function had gone idle.
-  try {
-    const r = await db.execute("SELECT version FROM schema_meta WHERE id = 1");
-    if (r.rows.length && Number(r.rows[0].version) >= SCHEMA_VERSION) {
-      return;
+  // start and added ~10-15s — past the client's timeout.
+  //
+  // A cold lambda's FIRST connection to Turso occasionally hangs for 15s+, while
+  // a fresh client almost always connects in <1s. So probe the schema version
+  // with a short per-attempt timeout and retry on a NEW client before giving up
+  // — this turns most would-be connection hangs into a fast success instead of a
+  // "database unavailable" / "connexion trop lente" error at the desk.
+  const PROBE_TIMEOUT_MS = 4000;
+  const PROBE_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+    db = createClient({ url, authToken });
+    try {
+      const r = await dbTimeout(
+        db.execute("SELECT version FROM schema_meta WHERE id = 1"),
+        PROBE_TIMEOUT_MS,
+        "DB_PROBE_TIMEOUT",
+      );
+      // Connected. If the schema is current we're done; otherwise fall through
+      // to the one-time setup sweep below.
+      if (r.rows.length && Number(r.rows[0].version) >= SCHEMA_VERSION) return;
+      break;
+    } catch (e: any) {
+      if (e?.message === "DB_PROBE_TIMEOUT") {
+        // Connection hung — try again with a brand-new client.
+        if (attempt < PROBE_ATTEMPTS) continue;
+        throw e; // exhausted retries → handler returns a fast 503
+      }
+      // A real SQL error (schema_meta table absent on first boot) means we ARE
+      // connected — proceed to the full setup below.
+      break;
     }
-  } catch { /* schema_meta absent → first boot on this DB; run the full setup */ }
+  }
 
   // Create tables
   await db.executeMultiple(`
