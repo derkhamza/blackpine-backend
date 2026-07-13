@@ -96,6 +96,100 @@ router.get("/stats", authRequired, async (req: Request, res: Response) => {
   }
 });
 
+// ── Business / finance aggregation (CEO view) ────────────────────────────────
+// Monetization is manual activation codes + plan fields (no payment table), so
+// revenue is DERIVED: current active-paid state gives point-in-time MRR, and
+// redeemed activation_codes give the real booked-revenue timeline. Aggregated in
+// JS (single-operator scale) to avoid TEXT-date SQL pitfalls.
+router.get("/finance", authRequired, async (req: Request, res: Response) => {
+  if (!isAdmin(req)) return res.status(403).json({ error: "Accès réservé" });
+  try {
+    const db = getDb();
+    const now = Date.now();
+    const TRIAL_MS = 30 * 86400000;
+    const curMonth = new Date().toISOString().slice(0, 7);
+    const monthKey = (iso: string) => (iso || "").slice(0, 7);
+    const last12 = () => {
+      const out: string[] = [];
+      const d = new Date();
+      for (let i = 11; i >= 0; i--) {
+        const m = new Date(d.getFullYear(), d.getMonth() - i, 1);
+        out.push(`${m.getFullYear()}-${String(m.getMonth() + 1).padStart(2, "0")}`);
+      }
+      return out;
+    };
+
+    const users = await db.execute("SELECT created_at, trial_start, COALESCE(subscription_plan,'free_trial') plan, subscription_expires_at FROM users");
+    let codes: any = { rows: [] };
+    try { codes = await db.execute("SELECT plan, duration_days, used, used_at, created_at FROM activation_codes"); } catch { /* table may be empty/absent */ }
+
+    const activeByPlan: Record<string, number> = {};
+    let activePaid = 0, expiredPaid = 0, activeTrials = 0, expiredTrials = 0, activeLifetime = 0, expiredThisMonth = 0;
+    const signupsByMonthMap: Record<string, number> = {};
+
+    for (const u of users.rows as any[]) {
+      const plan = String(u.plan || "free_trial");
+      const exp = u.subscription_expires_at ? new Date(String(u.subscription_expires_at)).getTime() : null;
+      const cm = monthKey(String(u.created_at || ""));
+      if (cm) signupsByMonthMap[cm] = (signupsByMonthMap[cm] || 0) + 1;
+
+      if (plan === "free_trial") {
+        const ts = u.trial_start ? new Date(String(u.trial_start)).getTime() : null;
+        if (ts && now - ts < TRIAL_MS) activeTrials++; else expiredTrials++;
+      } else {
+        const isLifetime = plan === "lifetime";
+        const active = isLifetime || exp == null || exp > now;
+        if (active) {
+          activePaid++;
+          activeByPlan[plan] = (activeByPlan[plan] || 0) + 1;
+          if (isLifetime) activeLifetime++;
+        } else {
+          expiredPaid++;
+          if (exp != null && new Date(exp).toISOString().slice(0, 7) === curMonth) expiredThisMonth++;
+        }
+      }
+    }
+
+    let issued = 0, redeemed = 0;
+    const redeemedByMonthMap: Record<string, number> = {};
+    const byPlan: Record<string, number> = {};
+    const bucketMap: Record<string, { month: string; plan: string; durationDays: number; count: number }> = {};
+    for (const c of codes.rows as any[]) {
+      issued++;
+      if (Number(c.used) === 1) {
+        redeemed++;
+        const m = monthKey(String(c.used_at || c.created_at || ""));
+        if (m) redeemedByMonthMap[m] = (redeemedByMonthMap[m] || 0) + 1;
+        const plan = String(c.plan || "pro");
+        byPlan[plan] = (byPlan[plan] || 0) + 1;
+        const dur = Number(c.duration_days || 0);
+        const key = `${m}|${plan}|${dur}`;
+        (bucketMap[key] ||= { month: m, plan, durationDays: dur, count: 0 }).count++;
+      }
+    }
+
+    const months = last12();
+    return res.json({
+      generatedAt: new Date().toISOString(),
+      subs: {
+        total: (users.rows as any[]).length,
+        activePaid, expiredPaid, activeByPlan, activeTrials, expiredTrials, activeLifetime,
+      },
+      signupsByMonth: months.map(m => ({ month: m, count: signupsByMonthMap[m] || 0 })),
+      codes: {
+        issued, redeemed, unused: issued - redeemed,
+        redeemedByMonth: months.map(m => ({ month: m, count: redeemedByMonthMap[m] || 0 })),
+        redeemedBuckets: Object.values(bucketMap),
+        byPlan,
+      },
+      expiredThisMonth,
+    });
+  } catch (err: any) {
+    console.error("[ADMIN] finance error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
 // ── Behavioural analytics aggregation ────────────────────────────────────────
 
 router.get("/events", authRequired, async (req: Request, res: Response) => {
