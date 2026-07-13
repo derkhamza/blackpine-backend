@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { getDb } from "../db/database";
+import { getDb, logSubEvent } from "../db/database";
 import { authRequired } from "../middleware/auth";
 
 function generateActivationCode(): string {
@@ -66,6 +66,7 @@ router.post("/validate-code", authRequired, async (req, res) => {
       sql: "UPDATE users SET subscription_plan = ?, subscription_expires_at = ? WHERE id = ?",
       args: [row.plan, expiresAt, userId],
     });
+    void logSubEvent({ userId, type: "convert", toPlan: String(row.plan), durationDays: (row.duration_days as number) ?? null, source: "code" });
 
     console.log(`[SUB] User ${userId} activated plan=${row.plan} expires=${expiresAt}`);
 

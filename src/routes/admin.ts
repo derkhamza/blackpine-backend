@@ -9,7 +9,7 @@
  */
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
-import { getDb } from "../db/database";
+import { getDb, logSubEvent } from "../db/database";
 import { authRequired } from "../middleware/auth";
 import { decryptField } from "../crypto/dataCipher";
 
@@ -168,6 +168,35 @@ router.get("/finance", authRequired, async (req: Request, res: Response) => {
       }
     }
 
+    // ── Exact cohorts from the subscription_events log ──
+    let cohorts: { month: string; signups: number; converted: number; rate: number }[] = [];
+    let conversionsByMonth: { month: string; count: number }[] = [];
+    let eventsLogged = 0;
+    try {
+      const evts = await db.execute("SELECT user_id, type, to_plan, created_at FROM subscription_events");
+      eventsLogged = (evts.rows as any[]).length;
+      const signupMonth: Record<string, string> = {};   // earliest signup month per user
+      const converted: Record<string, boolean> = {};
+      const convByMonth: Record<string, number> = {};
+      for (const e of evts.rows as any[]) {
+        const uid = String(e.user_id), t = String(e.type), mk = monthKey(String(e.created_at || ""));
+        if (t === "signup") { if (!signupMonth[uid] || (mk && mk < signupMonth[uid])) signupMonth[uid] = mk; }
+        const isConv = t === "convert" || t === "renew" || (t === "plan_change" && e.to_plan && String(e.to_plan) !== "free_trial");
+        if (isConv) { converted[uid] = true; if (mk) convByMonth[mk] = (convByMonth[mk] || 0) + 1; }
+      }
+      const cMap: Record<string, { s: number; c: number }> = {};
+      for (const uid of Object.keys(signupMonth)) {
+        const mk = signupMonth[uid];
+        (cMap[mk] ||= { s: 0, c: 0 }).s++;
+        if (converted[uid]) cMap[mk].c++;
+      }
+      cohorts = last12().map(mo => {
+        const e = cMap[mo] || { s: 0, c: 0 };
+        return { month: mo, signups: e.s, converted: e.c, rate: e.s ? Math.round((e.c / e.s) * 100) : 0 };
+      });
+      conversionsByMonth = last12().map(mo => ({ month: mo, count: convByMonth[mo] || 0 }));
+    } catch { /* events table optional */ }
+
     const months = last12();
     return res.json({
       generatedAt: new Date().toISOString(),
@@ -183,6 +212,9 @@ router.get("/finance", authRequired, async (req: Request, res: Response) => {
         byPlan,
       },
       expiredThisMonth,
+      cohorts,
+      conversionsByMonth,
+      eventsLogged,
     });
   } catch (err: any) {
     console.error("[ADMIN] finance error:", err.message);
@@ -506,6 +538,7 @@ router.post("/doctors/:id/plan", authRequired, async (req: Request, res: Respons
       sql: "UPDATE users SET subscription_plan = ?, subscription_expires_at = ? WHERE id = ?",
       args: [plan, exp, id],
     });
+    void logSubEvent({ userId: id, type: "plan_change", fromPlan: (user as any).subscription_plan ?? null, toPlan: plan, source: "admin" });
     console.log(`[ADMIN] ${(req as any).user.email} set plan=${plan} exp=${exp} for ${user.email}`);
     return res.json({ ok: true, plan, expiresAt: exp });
   } catch (err: any) {
@@ -526,6 +559,7 @@ router.post("/doctors/:id/trial", authRequired, async (req: Request, res: Respon
       sql: "UPDATE users SET subscription_plan = 'free_trial', trial_start = ?, subscription_expires_at = NULL WHERE id = ?",
       args: [now, id],
     });
+    void logSubEvent({ userId: id, type: "trial_reset", toPlan: "free_trial", source: "admin" });
     console.log(`[ADMIN] ${(req as any).user.email} reset trial for ${user.email}`);
     return res.json({ ok: true, trialStart: now });
   } catch (err: any) {
@@ -546,6 +580,7 @@ router.post("/doctors/:id/expire", authRequired, async (req: Request, res: Respo
       sql: "UPDATE users SET subscription_plan = 'free_trial', trial_start = '2000-01-01T00:00:00.000Z', subscription_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?",
       args: [id],
     });
+    void logSubEvent({ userId: id, type: "expire", fromPlan: (user as any).subscription_plan ?? null, toPlan: "free_trial", source: "admin" });
     console.log(`[ADMIN] ${(req as any).user.email} EXPIRED ${user.email}`);
     return res.json({ ok: true });
   } catch (err: any) {
@@ -612,6 +647,7 @@ router.post("/doctors/:id/extend", authRequired, async (req: Request, res: Respo
     const next = new Date(from + days * 86400000).toISOString();
     const plan = row.subscription_plan && row.subscription_plan !== "free_trial" ? row.subscription_plan : "pro";
     await getDb().execute({ sql: "UPDATE users SET subscription_plan = ?, subscription_expires_at = ? WHERE id = ?", args: [plan, next, id] });
+    void logSubEvent({ userId: id, type: "renew", fromPlan: String(row.subscription_plan ?? ""), toPlan: plan, durationDays: days, source: "admin" });
     console.log(`[ADMIN] ${(req as any).user.email} extended ${row.email} by ${days}d → ${next}`);
     return res.json({ ok: true, plan, expiresAt: next });
   } catch (err: any) {

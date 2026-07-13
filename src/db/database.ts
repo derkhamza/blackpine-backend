@@ -1,4 +1,5 @@
 import { neon, NeonQueryFunction } from "@neondatabase/serverless";
+import { randomUUID } from "crypto";
 
 // ── Neon (serverless Postgres) data layer ────────────────────────────────────
 //
@@ -28,7 +29,7 @@ export interface DbClient {
 let sqlFn: NeonQueryFunction<false, true> | null = null;
 let client: DbClient | null = null;
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 // Hard ceiling per query. Neon HTTP calls don't hang like a raw TCP connect, but
 // this keeps a slow network from ever riding the function's 300s ceiling.
@@ -229,6 +230,17 @@ const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS rate_limits (
      bucket TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, reset_at TEXT NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS idx_rate_limits_reset ON rate_limits(reset_at)`,
+  // Subscription lifecycle log — one row per plan transition (signup, convert,
+  // renew, expire, plan_change, trial_reset). Enables EXACT cohort conversion /
+  // churn / MRR-movement analytics over time (the users table only holds current
+  // state). Append-only; backfilled once from users + activation_codes on first run.
+  `CREATE TABLE IF NOT EXISTS subscription_events (
+     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, type TEXT NOT NULL,
+     from_plan TEXT, to_plan TEXT, duration_days INTEGER, source TEXT,
+     created_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `CREATE INDEX IF NOT EXISTS idx_sub_events_user ON subscription_events(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_sub_events_created ON subscription_events(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_sub_events_type ON subscription_events(type)`,
   `CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)`,
 ];
 
@@ -257,5 +269,42 @@ async function doInit(): Promise<void> {
   await runQuery(
     `INSERT INTO schema_meta (id, version) VALUES (1, ${SCHEMA_VERSION})
      ON CONFLICT (id) DO UPDATE SET version = ${SCHEMA_VERSION}`, []);
+
+  // One-time backfill of subscription_events from existing data (runs only when
+  // the table is empty). Gives immediate historical cohorts: a signup event per
+  // user, and a convert event per redeemed activation code linked by email.
+  try {
+    const c = await runQuery("SELECT count(*) c FROM subscription_events", []);
+    if (Number((c.rows[0] as any)?.c ?? 0) === 0) {
+      await runQuery(
+        `INSERT INTO subscription_events (id, user_id, type, to_plan, source, created_at)
+         SELECT 'bf-signup-' || id, id, 'signup', 'free_trial', 'system', created_at FROM users`, []);
+      await runQuery(
+        `INSERT INTO subscription_events (id, user_id, type, to_plan, duration_days, source, created_at)
+         SELECT 'bf-conv-' || ac.code, u.id, 'convert', ac.plan, ac.duration_days, 'code', ac.used_at
+         FROM activation_codes ac JOIN users u ON lower(u.email) = lower(ac.customer_email)
+         WHERE ac.used = 1 AND ac.used_at IS NOT NULL AND ac.customer_email IS NOT NULL`, []);
+      console.log("[DB] subscription_events backfilled");
+    }
+  } catch (e: any) { console.error("[DB] sub-events backfill skipped:", e?.message); }
+
   console.log("[DB] Neon schema ensured (version " + SCHEMA_VERSION + ")");
+}
+
+/**
+ * Append a subscription lifecycle event. Best-effort — never throws into the
+ * caller's flow (analytics must not block signups/redemptions).
+ */
+export async function logSubEvent(ev: {
+  userId: string; type: string;
+  fromPlan?: string | null; toPlan?: string | null; durationDays?: number | null; source?: string;
+}): Promise<void> {
+  try {
+    await getDb().execute({
+      sql: `INSERT INTO subscription_events (id, user_id, type, from_plan, to_plan, duration_days, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: [randomUUID(), ev.userId, ev.type, ev.fromPlan ?? null, ev.toPlan ?? null,
+             ev.durationDays ?? null, ev.source ?? "system", new Date().toISOString()],
+    });
+  } catch (e: any) { console.error("[DB] logSubEvent failed:", e?.message); }
 }

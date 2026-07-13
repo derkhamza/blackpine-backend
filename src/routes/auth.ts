@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
-import { getDb } from "../db/database";
+import { getDb, logSubEvent } from "../db/database";
 import { generateToken } from "../middleware/auth";
 import { consumeVerificationCode } from "./verify";
 import crypto from "crypto";
@@ -55,6 +55,7 @@ router.post("/signup", async (req: Request, res: Response) => {
       sql: "INSERT INTO users (id, email, password_hash, trial_start) VALUES (?, ?, ?, ?)",
       args: [id, email.toLowerCase().trim(), passwordHash, trialStart],
     });
+    void logSubEvent({ userId: id, type: "signup", toPlan: "free_trial", source: "system" });
 
     const token = generateToken({ userId: id, email });
     console.log(`[AUTH] New user registered: ${email}`);
