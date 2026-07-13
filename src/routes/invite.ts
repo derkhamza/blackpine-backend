@@ -1,12 +1,11 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../db/database";
-import { authRequired } from "../middleware/auth";
+import { authRequired, JWT_SECRET } from "../middleware/auth";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { decryptField } from "../crypto/dataCipher";
 
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET || "blackpine-dev-secret-change-in-production";
 
 function generateCode(): string {
   // Unambiguous chars (no 0/O, 1/I/L)
@@ -98,14 +97,17 @@ router.post("/redeem", async (req: Request, res: Response) => {
     const secretaryToken = jwt.sign(
       { type: "secretary", ownerUserId, secretaryId, code: upperCode },
       JWT_SECRET,
-      { expiresIn: "365d" },
+      { expiresIn: "365d", algorithm: "HS256" },
     );
 
     // Persist the session so we can revoke it later
     await db.execute({
-      sql: `INSERT OR REPLACE INTO secretary_sessions
+      sql: `INSERT INTO secretary_sessions
               (id, code, owner_user_id, token, created_at, revoked)
-            VALUES (?, ?, ?, ?, ?, 0)`,
+            VALUES (?, ?, ?, ?, ?, 0)
+            ON CONFLICT (id) DO UPDATE SET
+              code = EXCLUDED.code, owner_user_id = EXCLUDED.owner_user_id,
+              token = EXCLUDED.token, created_at = EXCLUDED.created_at, revoked = EXCLUDED.revoked`,
       args: [secretaryId, upperCode, ownerUserId, secretaryToken, now],
     });
 

@@ -55,10 +55,16 @@ export function isCipherActive(): boolean {
   }
 }
 
-/** Encrypt a UTF-8 string. No-op passthrough if no key is configured. */
+/** Encrypt a UTF-8 string. Fails CLOSED in production (never silently writes PHI
+ *  as plaintext); passthrough only in dev/test where no key is configured. */
 export function encryptField(plaintext: string): string {
   const key = getKey();
-  if (!key) return plaintext;
+  if (!key) {
+    if (process.env.NODE_ENV === "production" || process.env.REQUIRE_ENCRYPTION === "1") {
+      throw new Error("DATA_ENCRYPTION_KEY is not configured — refusing to store data unencrypted.");
+    }
+    return plaintext;
+  }
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
   const ct = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);

@@ -35,7 +35,26 @@ app.use(compression());
 // maxAge: Bearer auth forces a CORS preflight OPTIONS before every API call;
 // caching it (browsers cap ~2–24h) removes that second request+invocation on
 // every poll/push — a large cut to Edge Requests and Function Invocations.
-app.use(cors({ exposedHeaders: ["ETag"], maxAge: 86400 }));
+// Lock CORS to the app's own origins. Auth is a Bearer token (a stolen token
+// works from anywhere regardless), but this stops a hostile website from
+// scripting the API inside a logged-in user's browser. Requests with NO Origin
+// header — the native mobile app, server-to-server, curl — are allowed, since
+// CORS is a browser-only control and those clients aren't subject to it.
+const ALLOWED_ORIGINS = new Set([
+  "https://www.blackpinecap.com",
+  "https://blackpinecap.com",
+]);
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);                                   // native app / server-to-server
+    if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);               // production web
+    if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return cb(null, true); // local dev
+    if (/^https:\/\/blackpine-[a-z0-9-]+-hamza-derkaouis-projects\.vercel\.app$/.test(origin)) return cb(null, true); // Vercel previews
+    return cb(null, false);                                               // unknown origin → no ACAO, browser blocks
+  },
+  exposedHeaders: ["ETag"],
+  maxAge: 86400,
+}));
 
 // Every response here is per-user (keyed by the Bearer token, not the URL).
 // Without this a browser or CDN could reuse ONE account's cached GET for a
@@ -57,7 +76,10 @@ app.use("/auth", rateLimit(30, 15 * 60 * 1000), authRoutes);
 app.use("/reset", rateLimit(8, 15 * 60 * 1000), resetRoutes);
 app.use("/verify", rateLimit(10, 10 * 60 * 1000), verifyRouter);
 app.use("/subscription", rateLimit(10, 15 * 60 * 1000), subscriptionRouter);
-app.use("/ocr-proxy", ocrProxyRouter);
+// OCR relay uses the owner's paid OCR key → require auth + rate-limit so it can't
+// be used as an open, uncapped proxy that burns the key. (Mobile already sends
+// the Bearer token; the web uses the authenticated /ocr route.)
+app.use("/ocr-proxy", rateLimit(20, 15 * 60 * 1000), authRequired, ocrProxyRouter);
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "blackpine-backend", encryption: isCipherActive() });
@@ -105,7 +127,30 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+// Absolute ceiling on how long ANY request may run before we force a response.
+// This is the ultimate backstop against a mid-request DB hang (a warm instance
+// whose Turso connection dies after init has a route query with no init-gate to
+// stop it): without this such a request rides Vercel's 300s function timeout and
+// piles up invocations, turning a brief Turso blip into a full outage. Normal
+// requests finish in well under a second, so this never trips in healthy
+// operation. Kept above DB_INIT_TIMEOUT_MS so the clearer 503 wins on cold init.
+const REQUEST_DEADLINE_MS = 25_000;
+
 const handler = async (req: any, res: any) => {
+  // Force a 503 if nothing has responded within the deadline, so no request can
+  // hang to the 300s function ceiling. Cleared as soon as the response is sent.
+  const deadline = setTimeout(() => {
+    if (!res.headersSent) {
+      console.error("[REQ] Deadline exceeded:", req.method, req.url);
+      res.statusCode = 503;
+      res.setHeader("Content-Type", "application/json");
+      res.setHeader("Retry-After", "5");
+      res.end(JSON.stringify({ error: "request_timeout" }));
+    }
+  }, REQUEST_DEADLINE_MS);
+  res.on("finish", () => clearTimeout(deadline));
+  res.on("close", () => clearTimeout(deadline));
+
   // Health checks and CORS preflights must NEVER wait on the database: the
   // uptime monitor keeps the function warm, and the browser preflights every
   // authenticated call. Serve them straight from the app (cors + /health touch

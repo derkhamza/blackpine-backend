@@ -1,14 +1,14 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getDb } from "../db/database";
-import { authRequired } from "../middleware/auth";
+import { authRequired, JWT_SECRET } from "../middleware/auth";
 import { subscriptionRequired } from "../middleware/subscription";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
-import type { Client } from "@libsql/client";
+import type { DbClient as Client } from "../db/database";
 import { encryptField, decryptField } from "./../crypto/dataCipher";
+import { webPushPublicKey, saveWebPushSub, sendWebPushToOtherRole } from "../push/webPush";
 
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET || "blackpine-dev-secret-change-in-production";
 
 // A snapshot's version is its updated_at; derive a stable ETag from it so pulls
 // can be answered with 304 Not Modified when nothing has changed. Every write
@@ -108,7 +108,7 @@ async function secretaryAuthRequired(
 
   const token = header.slice(7);
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] }) as any;
     if (decoded.type !== "secretary") {
       return res.status(401).json({ error: "Token invalide" });
     }
@@ -517,7 +517,7 @@ router.get("/my", authRequired, async (req: Request, res: Response) => {
 // secretary — even with a stale snapshot — to clobber the doctor's clinical data.
 
 const SECRETARY_APPT_FIELDS = [
-  "date", "startTime", "endTime", "status", "type",
+  "date", "startTime", "endTime", "status", "type", "labelId",
   "patientId", "patientName", "patientPhone", "motif", "notes",
   "location", "recurringRuleId", "reminderSent",
   // Moroccan secretaries take the measurements and handle billing at the desk.
@@ -822,5 +822,250 @@ router.post(
     }
   },
 );
+
+// ── Live signal bus (doctor ↔ secretary) ─────────────────────────────────────
+// A featherweight channel, separate from the heavy snapshot: the doctor calling
+// a patient in ("Faire entrer") or ringing the secretary is reflected within the
+// poll interval (~2.5 s) instead of the 25 s snapshot floor, with a toast. Accepts
+// EITHER a doctor token or a secretary token and resolves the cabinet + role, so
+// both sides share the same two endpoints. Rows are tiny and pruned aggressively.
+async function cabinetIdentity(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith("Bearer ")) return res.status(401).json({ error: "Token manquant" });
+  try {
+    const decoded = jwt.verify(header.slice(7), JWT_SECRET, { algorithms: ["HS256"] }) as any;
+    if (decoded.type === "secretary") {
+      const db = getDb();
+      const r = await db.execute({
+        sql: "SELECT revoked FROM secretary_sessions WHERE id = ?",
+        args: [decoded.secretaryId],
+      });
+      if (r.rows.length === 0 || (r.rows[0].revoked as number) === 1) {
+        return res.status(401).json({ error: "Accès révoqué" });
+      }
+      (req as any).cab = { ownerUserId: decoded.ownerUserId, role: "secretary" };
+    } else {
+      (req as any).cab = { ownerUserId: decoded.userId, role: "doctor" };
+    }
+    next();
+  } catch {
+    return res.status(401).json({ error: "Token invalide ou expiré" });
+  }
+}
+
+// POST /cabinet/signal — emit a live signal to the OTHER side of the cabinet.
+router.post("/signal", cabinetIdentity, async (req: Request, res: Response) => {
+  try {
+    const { ownerUserId, role } = (req as any).cab;
+    const { type, payload, fromName } = req.body ?? {};
+    if (!type || typeof type !== "string") return res.status(400).json({ error: "type requis" });
+    const db = getDb();
+    const now = new Date().toISOString();
+    await db.execute({
+      sql: `INSERT INTO cabinet_signals (id, owner_user_id, from_role, from_name, type, payload, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      args: [
+        crypto.randomUUID(), ownerUserId, role,
+        typeof fromName === "string" ? fromName.slice(0, 80) : null,
+        type.slice(0, 40), JSON.stringify(payload ?? {}).slice(0, 2000), now,
+      ],
+    });
+    // Keep the table tiny: drop this cabinet's signals older than 2h.
+    await db.execute({
+      sql: "DELETE FROM cabinet_signals WHERE owner_user_id = ? AND created_at < ?",
+      args: [ownerUserId, new Date(Date.now() - 2 * 3600_000).toISOString()],
+    });
+    // Also fire a browser push to the other side so they're alerted even when the
+    // tab is backgrounded/closed (the in-app poll only fires while it's visible).
+    const p = (payload ?? {}) as any;
+    const who = typeof fromName === "string" && fromName ? fromName : (role === "doctor" ? "Le médecin" : "La secrétaire");
+    const pushBody = type === "patient_called"
+      ? `Patient appelé en consultation${p.patientName ? " : " + p.patientName : ""}`
+      : type === "intercom"
+        ? `${who} vous appelle`
+        : "Nouvelle notification";
+    await sendWebPushToOtherRole(ownerUserId, role, { title: "Blackpine", body: pushBody, tag: "bp-" + type });
+    return res.json({ ok: true, createdAt: now });
+  } catch (err: any) {
+    console.error("[CABINET] Signal emit error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
+// GET /cabinet/signals?since=<iso> — poll for signals from the OTHER role. Pass
+// back the server `now` from the previous response as the next `since` (avoids
+// client clock skew). Defaults to the last minute on first poll.
+router.get("/signals", cabinetIdentity, async (req: Request, res: Response) => {
+  try {
+    const { ownerUserId, role } = (req as any).cab;
+    const since = typeof req.query.since === "string" && req.query.since
+      ? req.query.since
+      : new Date(Date.now() - 60_000).toISOString();
+    const db = getDb();
+    const r = await db.execute({
+      sql: `SELECT id, from_role, from_name, type, payload, created_at
+            FROM cabinet_signals
+            WHERE owner_user_id = ? AND from_role <> ? AND created_at > ?
+            ORDER BY created_at ASC LIMIT 20`,
+      args: [ownerUserId, role, since],
+    });
+    return res.json({
+      now: new Date().toISOString(),
+      signals: r.rows.map((s: any) => ({
+        id: s.id, fromRole: s.from_role, fromName: s.from_name,
+        type: s.type, payload: JSON.parse((s.payload as string) || "{}"), createdAt: s.created_at,
+      })),
+    });
+  } catch (err: any) {
+    console.error("[CABINET] Signals poll error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
+// ── Web push (browser notifications) ─────────────────────────────────────────
+// The public VAPID key the browser needs to subscribe (not secret).
+router.get("/vapid-key", (_req: Request, res: Response) => {
+  const key = webPushPublicKey();
+  if (!key) return res.status(503).json({ error: "push_not_configured" });
+  return res.json({ key });
+});
+
+// Register this browser's push subscription for the caller's side of the cabinet.
+router.post("/web-subscribe", cabinetIdentity, async (req: Request, res: Response) => {
+  try {
+    const { ownerUserId, role } = (req as any).cab;
+    const { subscription } = req.body ?? {};
+    await saveWebPushSub(ownerUserId, role, subscription);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[CABINET] web-subscribe error:", err.message);
+    return res.status(400).json({ error: "Abonnement invalide" });
+  }
+});
+
+// ── Doctor ↔ secretary chat (persistent) ─────────────────────────────────────
+// POST /cabinet/chat — send a message; also web-pushes the other side.
+router.post("/chat", cabinetIdentity, async (req: Request, res: Response) => {
+  try {
+    const { ownerUserId, role } = (req as any).cab;
+    const { body, fromName } = req.body ?? {};
+    const text = String(body ?? "").trim();
+    if (!text) return res.status(400).json({ error: "Message vide" });
+    const db = getDb();
+    const now = new Date().toISOString();
+    const id = crypto.randomUUID();
+    await db.execute({
+      sql: `INSERT INTO cabinet_messages (id, owner_user_id, from_role, from_name, body, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+      args: [id, ownerUserId, role, typeof fromName === "string" ? fromName.slice(0, 80) : null, text.slice(0, 2000), now],
+    });
+    // Cap history at the newest 300 messages per cabinet.
+    await db.execute({
+      sql: `DELETE FROM cabinet_messages WHERE owner_user_id = ? AND id NOT IN (
+              SELECT id FROM cabinet_messages WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT 300)`,
+      args: [ownerUserId, ownerUserId],
+    });
+    const who = typeof fromName === "string" && fromName ? fromName : (role === "doctor" ? "Le médecin" : "La secrétaire");
+    await sendWebPushToOtherRole(ownerUserId, role, { title: who, body: text.slice(0, 120), tag: "bp-chat", url: "/" });
+    return res.json({ ok: true, id, createdAt: now });
+  } catch (err: any) {
+    console.error("[CABINET] chat send error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
+// GET /cabinet/chat[?since=<iso>] — messages both ways; without `since`, the last 50.
+router.get("/chat", cabinetIdentity, async (req: Request, res: Response) => {
+  try {
+    const { ownerUserId } = (req as any).cab;
+    const db = getDb();
+    const since = typeof req.query.since === "string" && req.query.since ? req.query.since : null;
+    const r = since
+      ? await db.execute({
+          sql: "SELECT id, from_role, from_name, body, created_at FROM cabinet_messages WHERE owner_user_id = ? AND created_at > ? ORDER BY created_at ASC LIMIT 100",
+          args: [ownerUserId, since],
+        })
+      : await db.execute({
+          sql: "SELECT id, from_role, from_name, body, created_at FROM (SELECT * FROM cabinet_messages WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT 50) sub ORDER BY created_at ASC",
+          args: [ownerUserId],
+        });
+    return res.json({
+      now: new Date().toISOString(),
+      messages: r.rows.map((m: any) => ({
+        id: m.id, fromRole: m.from_role, fromName: m.from_name, body: m.body, createdAt: m.created_at,
+      })),
+    });
+  } catch (err: any) {
+    console.error("[CABINET] chat fetch error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
+// ── Attachment object storage (Vercel Blob) ────────────────────────────────────
+// Moves the heavy patient files (scans, radiology, PDFs) OUT of the DB snapshot
+// and into cheap object storage. The binary is ENCRYPTED server-side before
+// upload (ciphertext at rest, even at a public blob URL) and only a tiny "blob:"
+// marker travels in the synced snapshot. Downloads are proxied + decrypted here,
+// scoped to the requesting cabinet's key prefix. Fully optional: without a Blob
+// store (BLOB_READ_WRITE_TOKEN unset) these return 501 and the web app keeps its
+// legacy inline-base64 behaviour.
+const BLOB_ENABLED = () => !!process.env.BLOB_READ_WRITE_TOKEN;
+
+// Whether the client should route new attachments to object storage.
+router.get("/storage-mode", cabinetIdentity, (_req: Request, res: Response) => {
+  res.json({ blob: BLOB_ENABLED() });
+});
+
+// Upload one attachment (base64 data URL) → returns the blob URL to store.
+router.post("/attachments", cabinetIdentity, async (req: Request, res: Response) => {
+  if (!BLOB_ENABLED()) return res.status(501).json({ error: "Stockage objet non configuré" });
+  try {
+    const { ownerUserId } = (req as any).cab;
+    const id = String(req.body?.id ?? "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 60);
+    const data = String(req.body?.data ?? "");
+    if (!id || !data.startsWith("data:")) return res.status(400).json({ error: "Requête invalide" });
+    const { put } = await import("@vercel/blob");
+    const cipher = encryptField(data);                 // ciphertext at rest
+    const key = `att/${ownerUserId}/${id}-${crypto.randomBytes(6).toString("hex")}`;
+    const blob = await put(key, cipher, { access: "public", contentType: "text/plain", addRandomSuffix: false });
+    return res.json({ ok: true, url: blob.url });
+  } catch (err: any) {
+    console.error("[CABINET] attachment upload error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
+// Fetch + decrypt one attachment by its blob URL (scoped to this cabinet).
+router.post("/attachments/get", cabinetIdentity, async (req: Request, res: Response) => {
+  if (!BLOB_ENABLED()) return res.status(501).json({ error: "Stockage objet non configuré" });
+  try {
+    const { ownerUserId } = (req as any).cab;
+    const url = String(req.body?.url ?? "");
+    if (!url.includes(`/att/${ownerUserId}/`)) return res.status(403).json({ error: "Accès refusé" });
+    const r = await fetch(url);
+    if (!r.ok) return res.status(404).json({ error: "Fichier introuvable" });
+    const cipher = await r.text();
+    return res.json({ ok: true, data: decryptField(cipher) });
+  } catch (err: any) {
+    console.error("[CABINET] attachment get error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
+// Delete one attachment blob (scoped to this cabinet).
+router.post("/attachments/del", cabinetIdentity, async (req: Request, res: Response) => {
+  if (!BLOB_ENABLED()) return res.json({ ok: true });   // nothing to delete
+  try {
+    const { ownerUserId } = (req as any).cab;
+    const url = String(req.body?.url ?? "");
+    if (!url.includes(`/att/${ownerUserId}/`)) return res.status(403).json({ error: "Accès refusé" });
+    const { del } = await import("@vercel/blob");
+    await del(url);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[CABINET] attachment del error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
 
 export default router;

@@ -1,10 +1,37 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../db/database";
-import { sendVerificationCode } from "../email/emailService";
+import { sendVerificationCode, sendAccountExistsNotice } from "../email/emailService";
 import crypto from "crypto";
 
 const uuid = () => crypto.randomUUID();
-const generateCode = () => String(Math.floor(100000 + Math.random() * 900000));
+// Cryptographically secure 6-digit code (Math.random is predictable → forgeable).
+const generateCode = () => String(crypto.randomInt(100000, 1000000));
+
+// Guesses allowed per issued code before it is burned (brute-force cap).
+const MAX_CODE_ATTEMPTS = 8;
+
+type CodeCheck = "ok" | "invalid" | "locked";
+
+// Look up the ACTIVE code for an email (not by the submitted value) so every
+// call — right or wrong — burns an attempt; burn the code after MAX_CODE_ATTEMPTS
+// so the 6-digit space can't be brute-forced.
+async function verifyCodeAttempt(email: string, code: string): Promise<CodeCheck> {
+  const db = getDb();
+  const e = email.toLowerCase().trim();
+  const r = await db.execute({
+    sql: "SELECT id, code, expires_at, attempts FROM email_verifications WHERE email = ? AND used = 0 ORDER BY created_at DESC LIMIT 1",
+    args: [e],
+  });
+  if (r.rows.length === 0) return "invalid";
+  const row = r.rows[0];
+  if (new Date(row.expires_at as string) < new Date()) return "invalid";
+  if (Number(row.attempts ?? 0) >= MAX_CODE_ATTEMPTS) {
+    await db.execute({ sql: "UPDATE email_verifications SET used = 1 WHERE id = ?", args: [row.id as string] });
+    return "locked";
+  }
+  await db.execute({ sql: "UPDATE email_verifications SET attempts = attempts + 1 WHERE id = ?", args: [row.id as string] });
+  return String(row.code) === String(code).trim() ? "ok" : "invalid";
+}
 
 const router = Router();
 
@@ -17,14 +44,18 @@ router.post("/send-code", async (req: Request, res: Response) => {
 
     const db = getDb();
 
-    // Refuse to re-verify an address that already has an account, so the user is
-    // told to log in instead of walking through a signup that would 409 anyway.
+    // Privacy: never reveal via the API response whether an address is already
+    // registered (that was an enumeration oracle). If it is, email the owner a
+    // "you already have an account" notice (no code) and return the SAME success
+    // as a fresh signup — the existence hint only ever reaches their own inbox.
     const existing = await db.execute({
       sql: "SELECT id FROM users WHERE email = ?",
       args: [email],
     });
     if (existing.rows.length > 0) {
-      return res.status(409).json({ error: "Un compte existe déjà avec cet email" });
+      try { await sendAccountExistsNotice(email); }
+      catch (e: any) { console.error("[VERIFY] account-exists notice failed:", e.message); }
+      return res.json({ success: true });
     }
 
     const code = generateCode();
@@ -70,8 +101,9 @@ router.post("/check-code", async (req: Request, res: Response) => {
     const code = String(req.body?.code || "").trim();
     if (!email || !code) return res.status(400).json({ error: "Email et code requis" });
 
-    const valid = await isVerificationCodeValid(email, code);
-    if (!valid) return res.status(400).json({ error: "Code incorrect ou expiré" });
+    const result = await verifyCodeAttempt(email, code);
+    if (result === "locked") return res.status(429).json({ error: "Trop de tentatives. Demandez un nouveau code." });
+    if (result !== "ok")     return res.status(400).json({ error: "Code incorrect ou expiré" });
 
     res.json({ verified: true });
   } catch (err: any) {
@@ -80,31 +112,14 @@ router.post("/check-code", async (req: Request, res: Response) => {
   }
 });
 
-// Shared helper: is there an unused, unexpired code matching this email?
-export async function isVerificationCodeValid(email: string, code: string): Promise<boolean> {
-  const db = getDb();
-  const result = await db.execute({
-    sql: "SELECT id, expires_at FROM email_verifications WHERE email = ? AND code = ? AND used = 0",
-    args: [email.toLowerCase().trim(), code.trim()],
-  });
-  if (result.rows.length === 0) return false;
-  const expiresAt = new Date(result.rows[0].expires_at as string);
-  return expiresAt >= new Date();
-}
-
 // Shared helper: consume (mark used) all pending codes for an email once signup
-// succeeds. Returns true if a valid code existed and was consumed.
+// succeeds. Goes through the same attempt-limited check, so a signup that guesses
+// codes is throttled just like /verify/check-code. Returns true only on a match.
 export async function consumeVerificationCode(email: string, code: string): Promise<boolean> {
-  const db = getDb();
   const e = email.toLowerCase().trim();
-  const result = await db.execute({
-    sql: "SELECT id, expires_at FROM email_verifications WHERE email = ? AND code = ? AND used = 0",
-    args: [e, code.trim()],
-  });
-  if (result.rows.length === 0) return false;
-  const expiresAt = new Date(result.rows[0].expires_at as string);
-  if (expiresAt < new Date()) return false;
-  await db.execute({
+  const result = await verifyCodeAttempt(e, code);
+  if (result !== "ok") return false;
+  await getDb().execute({
     sql: "UPDATE email_verifications SET used = 1 WHERE email = ?",
     args: [e],
   });

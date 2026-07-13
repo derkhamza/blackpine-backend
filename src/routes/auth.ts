@@ -8,6 +8,11 @@ const uuid = () => crypto.randomUUID();
 
 const router = Router();
 
+// A real cost-12 hash to compare against when the email is unknown, so login
+// takes the same time whether the email exists or not (defeats timing-based
+// account enumeration). Computed once at startup.
+const DUMMY_HASH = bcrypt.hashSync("blackpine-timing-equalizer", 12);
+
 router.post("/signup", async (req: Request, res: Response) => {
   try {
     const { email, password, code } = req.body;
@@ -15,14 +20,23 @@ router.post("/signup", async (req: Request, res: Response) => {
     if (!email || !password) {
       return res.status(400).json({ error: "Email et mot de passe requis" });
     }
-    if (password.length < 6) {
-      return res.status(400).json({ error: "Le mot de passe doit contenir au moins 6 caractères" });
+    if (password.length < 8) {
+      return res.status(400).json({ error: "Le mot de passe doit contenir au moins 8 caractères" });
     }
     if (!code) {
       return res.status(400).json({ error: "Code de vérification requis" });
     }
 
     const db = getDb();
+
+    // Verify the emailed code BEFORE checking existence, so an attacker without a
+    // valid code gets the same "code incorrect" answer whether or not the email is
+    // registered (no enumeration). A signup for an existing email never holds a
+    // valid code anyway — send-code issues none for addresses that already exist.
+    const verified = await consumeVerificationCode(email, code);
+    if (!verified) {
+      return res.status(400).json({ error: "Code de vérification incorrect ou expiré" });
+    }
 
     const existing = await db.execute({
       sql: "SELECT id FROM users WHERE email = ?",
@@ -31,12 +45,6 @@ router.post("/signup", async (req: Request, res: Response) => {
 
     if (existing.rows.length > 0) {
       return res.status(409).json({ error: "Un compte existe déjà avec cet email" });
-    }
-
-    // Email must be verified: consume a valid, unexpired code for this address.
-    const verified = await consumeVerificationCode(email, code);
-    if (!verified) {
-      return res.status(400).json({ error: "Code de vérification incorrect ou expiré" });
     }
 
     const id = uuid();
@@ -77,6 +85,9 @@ router.post("/login", async (req: Request, res: Response) => {
     });
 
     if (result.rows.length === 0) {
+      // Spend the same time as a real bcrypt check so an unknown email can't be
+      // distinguished from a wrong password by response time.
+      await bcrypt.compare(password, DUMMY_HASH);
       return res.status(401).json({ error: "Email ou mot de passe incorrect" });
     }
 
@@ -111,29 +122,9 @@ router.get("/me", (req: Request, res: Response) => {
   return res.json({ user });
 });
 
-router.get("/trial-status", async (req: Request, res: Response) => {
-  try {
-    const { email } = req.query;
-    if (!email) return res.status(400).json({ error: "Email requis" });
-
-    const db = getDb();
-    const result = await db.execute({
-      sql: "SELECT trial_start FROM users WHERE email = ?",
-      args: [String(email).toLowerCase().trim()],
-    });
-
-    if (result.rows.length === 0) return res.status(404).json({ error: "Utilisateur non trouvé" });
-
-    const trialStart = result.rows[0].trial_start as string;
-    const startDate = new Date(trialStart);
-    const now = new Date();
-    const daysElapsed = Math.floor((now.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
-    const daysLeft = Math.max(0, 30 - daysElapsed);
-
-    res.json({ trialStart, daysElapsed, daysLeft, expired: daysLeft <= 0 });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// NOTE: the old GET /trial-status?email= endpoint was removed — it was unused by
+// the apps and was an unauthenticated account-enumeration oracle (404 vs 200, with
+// the email exposed in the URL/logs). Trial state already rides in the /auth/login
+// and /auth/me responses for the authenticated user.
 
 export default router;

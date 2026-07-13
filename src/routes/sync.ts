@@ -36,18 +36,23 @@ router.get("/pull", async (req: Request, res: Response) => {
     }
     const userRow = userResult.rows[0];
     return res.json({
-      profile: profileRow ? JSON.parse(decryptField(profileRow.data as string)) : null,
+      // profileData is the decrypted profile with the embedded _assets /
+      // _recurringRules already stripped (see above).
+      profile: profileData,
       profileUpdatedAt: profileRow?.updated_at ?? null,
       transactions: transactionRows.map((r: any) => ({
         ...JSON.parse(decryptField(r.data as string)),
         id: r.id,
-        assets,
-        recurringRules,
       })),
       transactionsUpdatedAt:
         transactionRows.length > 0
           ? transactionRows[transactionRows.length - 1].updated_at
           : null,
+      // Assets & recurring rules are TOP-LEVEL fields the client reads as
+      // data.assets / data.recurringRules (previously nested inside each
+      // transaction by mistake, so they never round-tripped).
+      assets,
+      recurringRules,
       subscription: userRow ? {
         trialStart: userRow.trial_start,
         plan: userRow.subscription_plan || "free_trial",
@@ -92,7 +97,9 @@ const profileWithExtras = { ...profile, _assets: assets || [], _recurringRules: 
     // Insert new transactions
     for (const tx of transactions || []) {
       await db.execute({
-        sql: "INSERT OR REPLACE INTO transactions (id, user_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        sql: `INSERT INTO transactions (id, user_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+              ON CONFLICT (id) DO UPDATE SET user_id = EXCLUDED.user_id, data = EXCLUDED.data,
+                created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at`,
         args: [tx.id, userId, encryptField(JSON.stringify(tx)), now, now],
       });
     }

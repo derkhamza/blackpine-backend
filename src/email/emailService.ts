@@ -75,6 +75,24 @@ export async function sendVerificationCode(to: string, code: string): Promise<vo
   });
 }
 
+// Sent when someone tries to sign up with an already-registered address. Lets us
+// return the SAME API response for new and existing emails (no enumeration) while
+// still guiding the real owner — the existence hint only ever reaches their inbox.
+export async function sendAccountExistsNotice(to: string): Promise<void> {
+  await send({
+    to,
+    label: "Account-exists notice",
+    subject: "Vous avez déjà un compte — Blackpine",
+    html: `
+  <div style="font-family: sans-serif; max-width: 400px; margin: 0 auto; padding: 32px;">
+    <h2 style="color: #1E3A2F; margin-bottom: 8px;">Blackpine</h2>
+    <p style="color: #666; font-size: 14px;">Une inscription vient d'être tentée avec cette adresse, mais un compte existe déjà.</p>
+    <p style="color: #666; font-size: 14px;">Connectez-vous avec votre mot de passe depuis la page de connexion, ou réinitialisez-le si vous l'avez oublié.</p>
+    <p style="color: #999; font-size: 12px; margin-top: 24px;">Si vous n'êtes pas à l'origine de cette tentative, ignorez simplement cet email.</p>
+  </div>`,
+  });
+}
+
 export async function sendEmail(to: string, subject: string, html: string): Promise<void> {
   await send({ to, subject, html, label: "Email" });
 }

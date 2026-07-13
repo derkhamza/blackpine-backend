@@ -47,4 +47,25 @@ router.delete("/", async (req: Request, res: Response) => {
   }
 });
 
+// POST /account/logout-all — revoke every session everywhere (this device too)
+// by moving the tokens_valid_after cutoff to now. Useful if a device is lost or
+// a token may have leaked. The caller then re-authenticates.
+router.post("/logout-all", async (req: Request, res: Response) => {
+  try {
+    if ((req as any).user.type === "secretary") {
+      return res.status(403).json({ error: "Action réservée au titulaire du compte" });
+    }
+    const userId = (req as any).user.userId;
+    await getDb().execute({
+      sql: "UPDATE users SET tokens_valid_after = ? WHERE id = ?",
+      args: [new Date().toISOString(), userId],
+    });
+    console.warn(`[ACCOUNT] ${userId} logged out all sessions`);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[ACCOUNT] logout-all error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
 export default router;

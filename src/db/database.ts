@@ -1,270 +1,258 @@
-import { createClient, Client } from "@libsql/client";
+import { neon, NeonQueryFunction } from "@neondatabase/serverless";
 
-let db: Client;
+// ── Neon (serverless Postgres) data layer ────────────────────────────────────
+//
+// Replaces Turso/libSQL. Neon's `neon()` driver runs every query as a stateless
+// HTTPS request (fetch) — there is NO persistent TCP connection to hang or pool
+// to exhaust, which is exactly the failure class that plagued the previous DB.
+//
+// To keep the 17 route files unchanged, a small translator adapts the app's
+// SQLite-flavoured SQL to Postgres at runtime: `?`→`$n` placeholders,
+// `datetime('now', …)`→ISO-text expressions, `strftime('%Y-%W', …)`→to_char,
+// and `INSERT OR IGNORE`→`… ON CONFLICT DO NOTHING`. The result shape mirrors the
+// old client: `{ rows, rowsAffected }`, so `.rows` access is untouched.
 
-// Bump this whenever the CREATE/ALTER sweep below changes (new table or column),
-// so existing databases re-run the setup once instead of skipping it forever.
-const SCHEMA_VERSION = 1;
+type Row = Record<string, any>;
+export interface DbResult { rows: Row[]; rowsAffected: number; lastInsertRowid?: undefined; }
+export type Stmt = string | { sql: string; args?: any[] };
 
-export function getDb(): Client {
-  if (!db) {
-    throw new Error("Database not initialized. Call initDatabase() first.");
-  }
-  return db;
+export interface DbClient {
+  execute(stmt: Stmt): Promise<DbResult>;
+  execute(sql: string, args: any[]): Promise<DbResult>;
+  // The optional mode arg (from the libsql API) is accepted and ignored — Neon
+  // batches run atomically as a single transaction regardless.
+  batch(stmts: Stmt[], mode?: string): Promise<DbResult[]>;
+  executeMultiple(sql: string): Promise<void>;
 }
 
-// Reject a promise after `ms` so a hung Turso connection doesn't stall forever.
-function dbTimeout<T>(p: Promise<T>, ms: number, tag: string): Promise<T> {
+let sqlFn: NeonQueryFunction<false, true> | null = null;
+let client: DbClient | null = null;
+
+const SCHEMA_VERSION = 7;
+
+// Hard ceiling per query. Neon HTTP calls don't hang like a raw TCP connect, but
+// this keeps a slow network from ever riding the function's 300s ceiling.
+const QUERY_TIMEOUT_MS = 12_000;
+
+function dbTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(tag)), ms);
+    const t = setTimeout(() => reject(new Error("DB_TIMEOUT")), ms);
     p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
   });
 }
 
-export async function initDatabase(): Promise<void> {
-  const url = process.env.TURSO_DATABASE_URL;
-  const authToken = process.env.TURSO_AUTH_TOKEN;
+// ── SQLite → Postgres SQL translation ────────────────────────────────────────
 
-  if (!url) {
-    throw new Error("TURSO_DATABASE_URL environment variable is required");
+// ISO-8601 UTC text (matches JS new Date().toISOString(), so string comparisons
+// on the app's TEXT timestamp columns keep working).
+const ISO = `'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'`;
+const NOW_ISO = `to_char((now() at time zone 'utc'), ${ISO})`;
+
+function translate(sql: string): string {
+  let s = sql;
+
+  // datetime('now', '+N unit') / ('-N unit') / ('now') → ISO text expression.
+  s = s.replace(/datetime\(\s*'now'\s*(?:,\s*'([+-])\s*(\d+)\s+(day|days|hour|hours|minute|minutes|month|months|year|years)'\s*)?\)/gi,
+    (_m, sign: string, num: string, unit: string) => {
+      if (!sign) return NOW_ISO;
+      const op = sign === "-" ? "-" : "+";
+      return `to_char(((now() at time zone 'utc') ${op} interval '${num} ${unit}'), ${ISO})`;
+    });
+
+  // strftime('%Y-%W', X) → ISO year-week bucket.
+  s = s.replace(/strftime\(\s*'%Y-%W'\s*,\s*([^)]+?)\)/gi, (_m, col: string) => `to_char((${col})::timestamptz, 'IYYY-IW')`);
+
+  // INSERT OR IGNORE → INSERT … ON CONFLICT DO NOTHING.
+  let ignore = false;
+  s = s.replace(/INSERT\s+OR\s+IGNORE\s+INTO/gi, () => { ignore = true; return "INSERT INTO"; });
+  if (ignore && !/ON\s+CONFLICT/i.test(s)) s = s.replace(/\s*;?\s*$/, "") + " ON CONFLICT DO NOTHING";
+
+  // ON CONFLICT(col) → ON CONFLICT (col) (be lenient about the space).
+  s = s.replace(/ON\s+CONFLICT\(/gi, "ON CONFLICT (");
+
+  // Positional ?  →  $1, $2, … (skip anything inside single-quoted string literals).
+  let i = 0;
+  let out = "";
+  let inStr = false;
+  for (let k = 0; k < s.length; k++) {
+    const c = s[k];
+    if (c === "'") { inStr = !inStr; out += c; continue; }
+    if (c === "?" && !inStr) { out += "$" + (++i); continue; }
+    out += c;
   }
+  return out;
+}
 
-  // Fast path: once the DB is at the current schema version, skip the ~40
-  // round-trip CREATE/ALTER sweep below. That sweep ran on EVERY serverless cold
-  // start and added ~10-15s — past the client's timeout.
-  //
-  // A cold lambda's FIRST connection to Turso occasionally hangs for 15s+, while
-  // a fresh client almost always connects in <1s. So probe the schema version
-  // with a short per-attempt timeout and retry on a NEW client before giving up
-  // — this turns most would-be connection hangs into a fast success instead of a
-  // "database unavailable" / "connexion trop lente" error at the desk.
-  // Force HTTP mode: a `libsql://` URL makes @libsql/client open a persistent
-  // WebSocket (hrana) connection, whose handshake can hang for 15s+ on a cold
-  // serverless lambda and holds a connection slot. `https://` uses stateless
-  // per-query HTTP requests — the mode Turso recommends for serverless — which
-  // can't hang on a handshake and never exhausts a connection pool. Turso serves
-  // both schemes on the same host, so this is a safe swap.
-  const httpUrl = url.replace(/^libsql:\/\//i, "https://");
-  db = createClient({ url: httpUrl, authToken });
+async function runQuery(sql: string, args: any[]): Promise<DbResult> {
+  if (!sqlFn) throw new Error("Database not initialized. Call initDatabase() first.");
+  const text = translate(sql);
+  const res: any = await dbTimeout(sqlFn.query(text, args), QUERY_TIMEOUT_MS);
+  // fullResults:true → { rows, rowCount, fields, ... }
+  return { rows: res.rows ?? [], rowsAffected: res.rowCount ?? 0 };
+}
 
-  // Give the cold connection ONE generous window (12s) rather than several short
-  // ones: a cold lambda's first request to Turso can take several seconds to
-  // establish, and aborting it every few seconds only guarantees failure. If it
-  // still hasn't answered in 12s the DB is genuinely unreachable → let the
-  // handler return a fast 503 (well under the client's 20s timeout).
+function stmtParts(s: Stmt): { sql: string; args: any[] } {
+  return typeof s === "string" ? { sql: s, args: [] } : { sql: s.sql, args: s.args ?? [] };
+}
+
+function makeClient(): DbClient {
+  const c: DbClient = {
+    execute(stmt: Stmt | string, args?: any[]) {
+      if (typeof stmt === "string") return runQuery(stmt, args ?? []);
+      return runQuery(stmt.sql, stmt.args ?? []);
+    },
+    // Atomic: Neon's transaction() sends every statement in ONE request and
+    // commits all-or-nothing (used for account/data deletion).
+    async batch(stmts: Stmt[]) {
+      if (!sqlFn) throw new Error("Database not initialized. Call initDatabase() first.");
+      const queries = stmts.map((s) => { const { sql, args } = stmtParts(s); return sqlFn!.query(translate(sql), args); });
+      const results: any[] = await dbTimeout(sqlFn.transaction(queries as any), QUERY_TIMEOUT_MS);
+      return results.map((r) => ({ rows: r?.rows ?? [], rowsAffected: r?.rowCount ?? 0 }));
+    },
+    async executeMultiple(sql: string) {
+      for (const part of sql.split(";").map((p) => p.trim()).filter(Boolean)) {
+        await runQuery(part, []);
+      }
+    },
+  };
+  return c;
+}
+
+export function getDb(): DbClient {
+  if (!client) throw new Error("Database not initialized. Call initDatabase() first.");
+  return client;
+}
+
+// ── Postgres schema (one statement per array entry — Neon HTTP runs one at a
+// time). Timestamp columns stay TEXT with an ISO default to match the app's
+// string-based date handling. ─────────────────────────────────────────────────
+const SCHEMA: string[] = [
+  `CREATE TABLE IF NOT EXISTS users (
+     id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT ${NOW_ISO}, updated_at TEXT NOT NULL DEFAULT ${NOW_ISO},
+     trial_start TEXT, subscription_plan TEXT DEFAULT 'free_trial', subscription_expires_at TEXT,
+     tokens_valid_after TEXT)`,
+  // Any token issued before this instant is rejected (password reset / "log out
+  // everywhere"). Lets us revoke otherwise-stateless doctor JWTs.
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS tokens_valid_after TEXT`,
+  `CREATE TABLE IF NOT EXISTS profiles (
+     user_id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `CREATE TABLE IF NOT EXISTS transactions (
+     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, data TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT ${NOW_ISO}, updated_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id)`,
+  `CREATE TABLE IF NOT EXISTS reset_codes (
+     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, code TEXT NOT NULL, expires_at TEXT NOT NULL,
+     used INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, created_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `ALTER TABLE reset_codes ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0`,
+  `CREATE TABLE IF NOT EXISTS email_verifications (
+     id TEXT PRIMARY KEY, email TEXT NOT NULL, code TEXT NOT NULL, expires_at TEXT NOT NULL,
+     used INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, created_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `ALTER TABLE email_verifications ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0`,
+  `CREATE INDEX IF NOT EXISTS idx_email_verifications_email ON email_verifications(email)`,
+  `CREATE TABLE IF NOT EXISTS activation_codes (
+     code TEXT PRIMARY KEY, plan TEXT NOT NULL, duration_days INTEGER, customer_email TEXT,
+     customer_name TEXT, created_at TEXT NOT NULL, used INTEGER DEFAULT 0, used_at TEXT)`,
+  `CREATE TABLE IF NOT EXISTS invite_codes (
+     code TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, expires_at TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT ${NOW_ISO}, used INTEGER DEFAULT 0)`,
+  `CREATE INDEX IF NOT EXISTS idx_invite_codes_owner ON invite_codes(owner_user_id)`,
+  `CREATE TABLE IF NOT EXISTS secretary_sessions (
+     id TEXT PRIMARY KEY, code TEXT NOT NULL, owner_user_id TEXT NOT NULL, token TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT ${NOW_ISO}, revoked INTEGER DEFAULT 0, account_id TEXT)`,
+  `CREATE INDEX IF NOT EXISTS idx_secretary_sessions_owner ON secretary_sessions(owner_user_id)`,
+  `CREATE TABLE IF NOT EXISTS secretary_accounts (
+     id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, username TEXT NOT NULL, password_hash TEXT NOT NULL,
+     name TEXT, created_at TEXT NOT NULL DEFAULT ${NOW_ISO}, revoked INTEGER DEFAULT 0)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_secretary_accounts_username ON secretary_accounts(username)`,
+  `CREATE INDEX IF NOT EXISTS idx_secretary_accounts_owner ON secretary_accounts(owner_user_id)`,
+  `CREATE TABLE IF NOT EXISTS cabinet_snapshots (
+     owner_user_id TEXT PRIMARY KEY, appointments TEXT NOT NULL DEFAULT '[]', patients TEXT NOT NULL DEFAULT '[]',
+     doctor_profile TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL DEFAULT ${NOW_ISO},
+     extra_data TEXT DEFAULT '{}')`,
+  `CREATE TABLE IF NOT EXISTS cabinet_backups (
+     id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, created_at TEXT NOT NULL, reason TEXT NOT NULL DEFAULT 'auto',
+     appointments TEXT NOT NULL DEFAULT '[]', patients TEXT NOT NULL DEFAULT '[]',
+     doctor_profile TEXT NOT NULL DEFAULT '{}', extra_data TEXT NOT NULL DEFAULT '{}')`,
+  `CREATE INDEX IF NOT EXISTS idx_cabinet_backups_owner ON cabinet_backups(owner_user_id, created_at)`,
+  // Live doctor↔secretary signal bus (call-in reflected instantly + intercom).
+  // Tiny, transient rows — polled fast and pruned aggressively; NOT the snapshot.
+  `CREATE TABLE IF NOT EXISTS cabinet_signals (
+     id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, from_role TEXT NOT NULL,
+     from_name TEXT, type TEXT NOT NULL, payload TEXT DEFAULT '{}',
+     created_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `CREATE INDEX IF NOT EXISTS idx_cabinet_signals_owner ON cabinet_signals(owner_user_id, created_at)`,
+  // Web-push subscriptions (browser notifications when the tab is backgrounded).
+  // Keyed by the (unique) push endpoint; role = which side of the cabinet subscribed.
+  `CREATE TABLE IF NOT EXISTS web_push_subs (
+     endpoint TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, role TEXT NOT NULL,
+     p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `CREATE INDEX IF NOT EXISTS idx_web_push_subs_owner ON web_push_subs(owner_user_id)`,
+  // Persistent doctor↔secretary chat (unlike the transient signal bus).
+  `CREATE TABLE IF NOT EXISTS cabinet_messages (
+     id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, from_role TEXT NOT NULL,
+     from_name TEXT, body TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `CREATE INDEX IF NOT EXISTS idx_cabinet_messages_owner ON cabinet_messages(owner_user_id, created_at)`,
+  `CREATE TABLE IF NOT EXISTS booking_links (
+     slug TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL UNIQUE, enabled INTEGER DEFAULT 1, doctor_name TEXT,
+     specialty TEXT, start_min INTEGER DEFAULT 540, end_min INTEGER DEFAULT 1020, slot_min INTEGER DEFAULT 30,
+     days TEXT DEFAULT '1,2,3,4,5,6', created_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `CREATE TABLE IF NOT EXISTS sms_config (
+     owner_user_id TEXT PRIMARY KEY, enabled INTEGER DEFAULT 0, lead_days INTEGER DEFAULT 1,
+     template TEXT, updated_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `CREATE TABLE IF NOT EXISTS sms_log (
+     owner_user_id TEXT NOT NULL, appointment_id TEXT NOT NULL, appt_date TEXT NOT NULL,
+     sent_at TEXT NOT NULL DEFAULT ${NOW_ISO}, status TEXT NOT NULL,
+     PRIMARY KEY (owner_user_id, appointment_id, appt_date))`,
+  `CREATE TABLE IF NOT EXISTS push_tokens (
+     token TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `CREATE INDEX IF NOT EXISTS idx_push_tokens_owner ON push_tokens(owner_user_id)`,
+  `CREATE TABLE IF NOT EXISTS analytics_events (
+     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, platform TEXT,
+     created_at TEXT NOT NULL DEFAULT ${NOW_ISO})`,
+  `CREATE INDEX IF NOT EXISTS idx_analytics_created ON analytics_events(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_analytics_name ON analytics_events(name)`,
+  // Connexion country (ISO-2), captured best-effort from the Vercel geo header on
+  // event ingestion. Only populated for events sent after this column shipped.
+  `ALTER TABLE analytics_events ADD COLUMN IF NOT EXISTS ip_country TEXT`,
+  `CREATE INDEX IF NOT EXISTS idx_analytics_user ON analytics_events(user_id)`,
+  `CREATE TABLE IF NOT EXISTS medications (
+     code TEXT PRIMARY KEY, nom TEXT NOT NULL, dci TEXT, dosage TEXT, unite TEXT, forme TEXT, presentation TEXT,
+     ppv REAL, ph REAL, prix_br REAL, type TEXT, taux_remboursement TEXT, search TEXT)`,
+  `CREATE INDEX IF NOT EXISTS idx_medications_search ON medications(search)`,
+  `CREATE INDEX IF NOT EXISTS idx_medications_nom ON medications(nom)`,
+  // Durable, cross-instance rate-limit counters (serverless functions don't share
+  // memory, so an in-process Map never aggregates). bucket = "<ip>:<route>".
+  `CREATE TABLE IF NOT EXISTS rate_limits (
+     bucket TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, reset_at TEXT NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS idx_rate_limits_reset ON rate_limits(reset_at)`,
+  `CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)`,
+];
+
+let initPromise: Promise<void> | null = null;
+
+export function initDatabase(): Promise<void> {
+  if (!initPromise) initPromise = doInit().catch((e) => { initPromise = null; throw e; });
+  return initPromise;
+}
+
+async function doInit(): Promise<void> {
+  const url = process.env.DATABASE_URL || process.env.NEON_DATABASE_URL;
+  if (!url) throw new Error("DATABASE_URL environment variable is required");
+  if (!sqlFn) { sqlFn = neon(url, { fullResults: true }); client = makeClient(); }
+
+  // Fast path: schema already at the current version.
   try {
-    const r = await dbTimeout(
-      db.execute("SELECT version FROM schema_meta WHERE id = 1"),
-      12_000,
-      "DB_PROBE_TIMEOUT",
-    );
-    // Connected. If the schema is current we're done; otherwise fall through to
-    // the one-time setup sweep below.
+    const r = await runQuery("SELECT version FROM schema_meta WHERE id = 1", []);
     if (r.rows.length && Number(r.rows[0].version) >= SCHEMA_VERSION) return;
   } catch (e: any) {
-    if (e?.message === "DB_PROBE_TIMEOUT") throw e; // unreachable → fast 503
-    // A real SQL error (schema_meta absent on first boot) means we ARE connected
-    // — proceed to the full setup below.
+    if (e?.message === "DB_TIMEOUT") throw new Error("DB_PROBE_TIMEOUT");
+    // schema_meta absent (fresh DB) → fall through and create everything.
   }
 
-  // Create tables
-  await db.executeMultiple(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS profiles (
-      user_id TEXT PRIMARY KEY,
-      data TEXT NOT NULL,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS transactions (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      data TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-
-    CREATE TABLE IF NOT EXISTS reset_codes (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      code TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      used INTEGER DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    -- Signup email-verification codes. Keyed by email (the user does not exist
-    -- yet), durable so codes survive serverless cold starts between send + verify.
-    CREATE TABLE IF NOT EXISTS email_verifications (
-      id TEXT PRIMARY KEY,
-      email TEXT NOT NULL,
-      code TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      used INTEGER DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_email_verifications_email ON email_verifications(email);
-
-    CREATE TABLE IF NOT EXISTS activation_codes (
-  code TEXT PRIMARY KEY,
-  plan TEXT NOT NULL,
-  duration_days INTEGER,
-  customer_email TEXT,
-  customer_name TEXT,
-  created_at TEXT NOT NULL,
-  used INTEGER DEFAULT 0,
-  used_at TEXT);
-    CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id);
-
-    CREATE TABLE IF NOT EXISTS invite_codes (
-      code TEXT PRIMARY KEY,
-      owner_user_id TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      used INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS secretary_sessions (
-      id TEXT PRIMARY KEY,
-      code TEXT NOT NULL,
-      owner_user_id TEXT NOT NULL,
-      token TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      revoked INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS cabinet_snapshots (
-      owner_user_id TEXT PRIMARY KEY,
-      appointments TEXT NOT NULL DEFAULT '[]',
-      patients TEXT NOT NULL DEFAULT '[]',
-      doctor_profile TEXT NOT NULL DEFAULT '{}',
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS cabinet_backups (
-      id TEXT PRIMARY KEY,
-      owner_user_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      reason TEXT NOT NULL DEFAULT 'auto',
-      appointments TEXT NOT NULL DEFAULT '[]',
-      patients TEXT NOT NULL DEFAULT '[]',
-      doctor_profile TEXT NOT NULL DEFAULT '{}',
-      extra_data TEXT NOT NULL DEFAULT '{}'
-    );
-    CREATE INDEX IF NOT EXISTS idx_cabinet_backups_owner ON cabinet_backups(owner_user_id, created_at);
-
-    CREATE INDEX IF NOT EXISTS idx_invite_codes_owner ON invite_codes(owner_user_id);
-    CREATE INDEX IF NOT EXISTS idx_secretary_sessions_owner ON secretary_sessions(owner_user_id);
-
-    -- Persistent secretary login accounts (username + password), linked to a
-    -- doctor, no expiry, revocable. Distinct from the one-off invite codes.
-    CREATE TABLE IF NOT EXISTS secretary_accounts (
-      id            TEXT PRIMARY KEY,
-      owner_user_id TEXT NOT NULL,
-      username      TEXT NOT NULL,
-      password_hash TEXT NOT NULL,
-      name          TEXT,
-      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-      revoked       INTEGER DEFAULT 0
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_secretary_accounts_username ON secretary_accounts(username);
-    CREATE INDEX IF NOT EXISTS idx_secretary_accounts_owner ON secretary_accounts(owner_user_id);
-
-    -- Public online-booking links. One per doctor; slug is the public identifier.
-    -- Working-hours config lives here (start/end minutes-from-midnight, slot length,
-    -- allowed weekdays 0=Sun..6=Sat). No patient data → not encrypted.
-    CREATE TABLE IF NOT EXISTS booking_links (
-      slug          TEXT PRIMARY KEY,
-      owner_user_id TEXT NOT NULL UNIQUE,
-      enabled       INTEGER DEFAULT 1,
-      doctor_name   TEXT,
-      specialty     TEXT,
-      start_min     INTEGER DEFAULT 540,
-      end_min       INTEGER DEFAULT 1020,
-      slot_min      INTEGER DEFAULT 30,
-      days          TEXT DEFAULT '1,2,3,4,5,6',
-      created_at    TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    -- Automated SMS reminder config, one row per doctor. Disabled by default.
-    CREATE TABLE IF NOT EXISTS sms_config (
-      owner_user_id TEXT PRIMARY KEY,
-      enabled       INTEGER DEFAULT 0,
-      lead_days     INTEGER DEFAULT 1,
-      template      TEXT,
-      updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    -- Idempotency / audit log so a reminder is sent at most once per appointment.
-    CREATE TABLE IF NOT EXISTS sms_log (
-      owner_user_id  TEXT NOT NULL,
-      appointment_id TEXT NOT NULL,
-      appt_date      TEXT NOT NULL,
-      sent_at        TEXT NOT NULL DEFAULT (datetime('now')),
-      status         TEXT NOT NULL,
-      PRIMARY KEY (owner_user_id, appointment_id, appt_date)
-    );
-
-    -- Expo push tokens (one device = one row) for server-sent notifications.
-    CREATE TABLE IF NOT EXISTS push_tokens (
-      token         TEXT PRIMARY KEY,
-      owner_user_id TEXT NOT NULL,
-      updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_push_tokens_owner ON push_tokens(owner_user_id);
-
-    -- Behavioural analytics: event NAMES only (e.g. "page:/agenda",
-    -- "action:create_rdv"). No PII. Used by the owner usage dashboard.
-    CREATE TABLE IF NOT EXISTS analytics_events (
-      id         TEXT PRIMARY KEY,
-      user_id    TEXT NOT NULL,
-      name       TEXT NOT NULL,
-      platform   TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_analytics_created ON analytics_events(created_at);
-    CREATE INDEX IF NOT EXISTS idx_analytics_name ON analytics_events(name);
-
-    -- Official Moroccan medication reference (DMP/CNOPS open data, ODbL).
-    -- Public reference data — NOT patient data, so not encrypted; it is queried.
-    CREATE TABLE IF NOT EXISTS medications (
-      code               TEXT PRIMARY KEY,
-      nom                TEXT NOT NULL,
-      dci                TEXT,
-      dosage             TEXT,
-      unite              TEXT,
-      forme              TEXT,
-      presentation       TEXT,
-      ppv                REAL,
-      ph                 REAL,
-      prix_br            REAL,
-      type               TEXT,           -- P (princeps) / G (générique)
-      taux_remboursement TEXT,
-      search             TEXT            -- normalized "nom dci" for fast lookup
-    );
-    CREATE INDEX IF NOT EXISTS idx_medications_search ON medications(search);
-    CREATE INDEX IF NOT EXISTS idx_medications_nom ON medications(nom);
-  `);
-    try { await db.execute("ALTER TABLE users ADD COLUMN trial_start TEXT"); } catch {}
-    try { await db.execute("ALTER TABLE users ADD COLUMN subscription_plan TEXT DEFAULT 'free_trial'"); } catch {}
-    try { await db.execute("ALTER TABLE users ADD COLUMN subscription_expires_at TEXT"); } catch {}
-    try { await db.execute("ALTER TABLE cabinet_snapshots ADD COLUMN extra_data TEXT DEFAULT '{}'"); } catch {}
-    // Link account-based secretary logins to their account so the doctor can revoke them.
-    try { await db.execute("ALTER TABLE secretary_sessions ADD COLUMN account_id TEXT"); } catch {}
-
-  // Record the schema version so subsequent cold starts take the fast path.
-  await db.executeMultiple(`
-    CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
-    INSERT INTO schema_meta (id, version) VALUES (1, ${SCHEMA_VERSION})
-      ON CONFLICT(id) DO UPDATE SET version = ${SCHEMA_VERSION};
-  `);
-  console.log("[DB] Schema ensured (version " + SCHEMA_VERSION + ")");
+  for (const stmt of SCHEMA) await runQuery(stmt, []);
+  await runQuery(
+    `INSERT INTO schema_meta (id, version) VALUES (1, ${SCHEMA_VERSION})
+     ON CONFLICT (id) DO UPDATE SET version = ${SCHEMA_VERSION}`, []);
+  console.log("[DB] Neon schema ensured (version " + SCHEMA_VERSION + ")");
 }

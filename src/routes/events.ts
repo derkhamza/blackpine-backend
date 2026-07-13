@@ -14,13 +14,12 @@
  */
 import { Router, Request, Response } from "express";
 import { getDb } from "../db/database";
-import { authRequired } from "../middleware/auth";
+import { authRequired, JWT_SECRET } from "../middleware/auth";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 
 const router = Router();
 
-const JWT_SECRET = process.env.JWT_SECRET || "blackpine-dev-secret-change-in-production";
 const MAX_BATCH = 50;
 const NAME_RE = /^[a-z0-9:_/.-]{1,80}$/i;
 
@@ -33,14 +32,20 @@ function sanitizeNames(body: any): string[] {
     .slice(0, MAX_BATCH);
 }
 
+/** Country (ISO-2) of the request, from Vercel's geo header. Null off-Vercel. */
+function reqCountry(req: Request): string | null {
+  const c = String(req.headers["x-vercel-ip-country"] ?? "").trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(c) ? c : null;
+}
+
 /** Insert a batch of event rows for one user. */
-async function storeEvents(userId: string, names: string[], platform: string): Promise<void> {
+async function storeEvents(userId: string, names: string[], platform: string, country: string | null): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
   for (const name of names) {
     await db.execute({
-      sql: "INSERT INTO analytics_events (id, user_id, name, platform, created_at) VALUES (?, ?, ?, ?, ?)",
-      args: ["ev_" + crypto.randomBytes(8).toString("hex"), userId, name, platform, now],
+      sql: "INSERT INTO analytics_events (id, user_id, name, platform, created_at, ip_country) VALUES (?, ?, ?, ?, ?, ?)",
+      args: ["ev_" + crypto.randomBytes(8).toString("hex"), userId, name, platform, now, country],
     });
   }
 }
@@ -52,7 +57,7 @@ router.post("/", authRequired, async (req: Request, res: Response) => {
     const platform = String(req.body?.platform ?? "web").slice(0, 16);
     const names = sanitizeNames(req.body);
     if (names.length === 0) return res.json({ ok: true, stored: 0 });
-    await storeEvents(userId, names, platform);
+    await storeEvents(userId, names, platform, reqCountry(req));
     return res.json({ ok: true, stored: names.length });
   } catch (err: any) {
     console.error("[EVENTS] ingest error:", err.message);
@@ -69,7 +74,7 @@ router.post("/secretary", async (req: Request, res: Response) => {
     }
     let decoded: any;
     try {
-      decoded = jwt.verify(header.slice(7), JWT_SECRET);
+      decoded = jwt.verify(header.slice(7), JWT_SECRET, { algorithms: ["HS256"] });
     } catch {
       return res.status(401).json({ error: "Token invalide ou expiré" });
     }
@@ -88,7 +93,7 @@ router.post("/secretary", async (req: Request, res: Response) => {
 
     const names = sanitizeNames(req.body);
     if (names.length === 0) return res.json({ ok: true, stored: 0 });
-    await storeEvents(decoded.ownerUserId, names, "mobile-secretary");
+    await storeEvents(decoded.ownerUserId, names, "mobile-secretary", reqCountry(req));
     return res.json({ ok: true, stored: names.length });
   } catch (err: any) {
     console.error("[EVENTS] secretary ingest error:", err.message);

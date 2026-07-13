@@ -8,6 +8,7 @@
  * Data-volume counts decrypt snapshots transiently to read array lengths only.
  */
 import { Router, Request, Response } from "express";
+import bcrypt from "bcryptjs";
 import { getDb } from "../db/database";
 import { authRequired } from "../middleware/auth";
 import { decryptField } from "../crypto/dataCipher";
@@ -449,6 +450,72 @@ router.post("/doctors/:id/expire", authRequired, async (req: Request, res: Respo
   }
 });
 
+// ── Deep powers ────────────────────────────────────────────────────────────────
+
+// Force-logout everywhere: revoke every token issued before now (stateless JWTs
+// are rejected once iat < tokens_valid_after). The doctor must sign in again.
+router.post("/doctors/:id/logout", authRequired, async (req: Request, res: Response) => {
+  if (!isAdmin(req)) return res.status(403).json({ error: "Accès réservé" });
+  try {
+    const id = String(req.params.id);
+    const user = await loadUser(id);
+    if (!user) return res.status(404).json({ error: "Médecin introuvable" });
+    const now = new Date().toISOString();
+    await getDb().execute({ sql: "UPDATE users SET tokens_valid_after = ? WHERE id = ?", args: [now, id] });
+    console.warn(`[ADMIN] ${(req as any).user.email} force-logged-out ${user.email}`);
+    return res.json({ ok: true, at: now });
+  } catch (err: any) {
+    console.error("[ADMIN] logout error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
+// Set a new password for a doctor (owner support action) + revoke existing
+// sessions so the new password takes effect immediately.
+router.post("/doctors/:id/password", authRequired, async (req: Request, res: Response) => {
+  if (!isAdmin(req)) return res.status(403).json({ error: "Accès réservé" });
+  try {
+    const id = String(req.params.id);
+    const password = String(req.body?.password ?? "");
+    if (password.length < 8) return res.status(400).json({ error: "Mot de passe trop court (8 caractères min.)" });
+    const user = await loadUser(id);
+    if (!user) return res.status(404).json({ error: "Médecin introuvable" });
+    const hash = await bcrypt.hash(password, 12);
+    const now = new Date().toISOString();
+    await getDb().execute({ sql: "UPDATE users SET password_hash = ?, tokens_valid_after = ? WHERE id = ?", args: [hash, now, id] });
+    console.warn(`[ADMIN] ${(req as any).user.email} reset password for ${user.email}`);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[ADMIN] set password error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
+// Extend (or shorten) the subscription by N days from the later of now / current
+// expiry. Moves the account onto a paid plan if it was on the trial.
+router.post("/doctors/:id/extend", authRequired, async (req: Request, res: Response) => {
+  if (!isAdmin(req)) return res.status(403).json({ error: "Accès réservé" });
+  try {
+    const id = String(req.params.id);
+    const days = Math.round(Number(req.body?.days));
+    if (!Number.isFinite(days) || days === 0 || Math.abs(days) > 3650) return res.status(400).json({ error: "Nombre de jours invalide" });
+    const r = await getDb().execute({ sql: "SELECT email, subscription_plan, subscription_expires_at FROM users WHERE id = ?", args: [id] });
+    if (!r.rows.length) return res.status(404).json({ error: "Médecin introuvable" });
+    const row = r.rows[0] as any;
+    const now = Date.now();
+    const cur = row.subscription_expires_at ? Date.parse(String(row.subscription_expires_at)) : NaN;
+    const from = Number.isFinite(cur) && cur > now ? cur : now;
+    const next = new Date(from + days * 86400000).toISOString();
+    const plan = row.subscription_plan && row.subscription_plan !== "free_trial" ? row.subscription_plan : "pro";
+    await getDb().execute({ sql: "UPDATE users SET subscription_plan = ?, subscription_expires_at = ? WHERE id = ?", args: [plan, next, id] });
+    console.log(`[ADMIN] ${(req as any).user.email} extended ${row.email} by ${days}d → ${next}`);
+    return res.json({ ok: true, plan, expiresAt: next });
+  } catch (err: any) {
+    console.error("[ADMIN] extend error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
 // Permanently delete an account and ALL its data. Requires confirmEmail to match.
 router.delete("/doctors/:id", authRequired, async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ error: "Accès réservé" });
@@ -474,6 +541,57 @@ router.delete("/doctors/:id", authRequired, async (req: Request, res: Response) 
     return res.json({ ok: true, deleted: user.email });
   } catch (err: any) {
     console.error("[ADMIN] delete account error:", err.message);
+    return res.status(500).json({ error: "Erreur" });
+  }
+});
+
+// ── Resource consumption: storage per cabinet + per-user usage + connexion geo ──
+// Storage = byte size of each cabinet's stored snapshot (encrypted blob length —
+// exactly what sits in the DB). "Compute" isn't directly measurable on serverless;
+// event volume + active hours are the engagement/activity proxies shown alongside.
+router.get("/consumption", authRequired, async (req: Request, res: Response) => {
+  if (!isAdmin(req)) return res.status(403).json({ error: "Accès réservé" });
+  try {
+    const db = getDb();
+    const emailRows = await db.execute("SELECT id, email FROM users");
+    const emailById = new Map<string, string>();
+    for (const r of emailRows.rows as any[]) emailById.set(String(r.id), String(r.email));
+
+    // Storage — snapshot byte size per cabinet.
+    const stoRows = await db.execute(
+      "SELECT owner_user_id, (octet_length(appointments)+octet_length(patients)+octet_length(doctor_profile)+octet_length(coalesce(extra_data,''))) bytes FROM cabinet_snapshots");
+    let totalBytes = 0;
+    const storeUsers = (stoRows.rows as any[]).map((r) => {
+      const bytes = num(r, "bytes");
+      totalBytes += bytes;
+      return { email: emailById.get(String(r.owner_user_id)) ?? "—", bytes };
+    });
+    storeUsers.sort((a, b) => b.bytes - a.bytes);
+    const storage = {
+      totalBytes,
+      cabinets: storeUsers.length,
+      avgBytes: storeUsers.length ? Math.round(totalBytes / storeUsers.length) : 0,
+      users: storeUsers.slice(0, 50).map((u) => ({ ...u, pct: totalBytes ? Math.round((u.bytes / totalBytes) * 1000) / 10 : 0 })),
+    };
+
+    // Usage — per user: events, active days, active hours (time-on-app proxy).
+    const usageRows = await db.execute(
+      "SELECT user_id, count(*) events, count(DISTINCT substr(created_at,1,10)) days, count(DISTINCT substr(created_at,1,13)) hours, max(created_at) last FROM analytics_events GROUP BY user_id");
+    const usageUsers = (usageRows.rows as any[]).map((r) => ({
+      email: emailById.get(String(r.user_id)) ?? "—",
+      events: num(r, "events"), activeDays: num(r, "days"), activeHours: num(r, "hours"),
+      lastEvent: String(r.last ?? ""),
+    }));
+    usageUsers.sort((a, b) => b.events - a.events);
+
+    // Connexion countries (populated going forward from the Vercel geo header).
+    const ctryRows = await db.execute(
+      "SELECT ip_country ctry, count(*) events, count(DISTINCT user_id) users FROM analytics_events WHERE ip_country IS NOT NULL GROUP BY ip_country ORDER BY events DESC LIMIT 30");
+    const countries = (ctryRows.rows as any[]).map((r) => ({ country: String(r.ctry), events: num(r, "events"), users: num(r, "users") }));
+
+    return res.json({ generatedAt: new Date().toISOString(), storage, usage: { users: usageUsers.slice(0, 50) }, countries });
+  } catch (err: any) {
+    console.error("[ADMIN] consumption error:", err.message);
     return res.status(500).json({ error: "Erreur" });
   }
 });

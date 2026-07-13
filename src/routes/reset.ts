@@ -7,9 +7,14 @@ const uuid = () => crypto.randomUUID();
 
 const router = Router();
 
+// Cryptographically secure 6-digit code (Math.random is predictable → forgeable).
 function generateCode(): string {
-  return String(Math.floor(100000 + Math.random() * 900000));
+  return String(crypto.randomInt(100000, 1000000));
 }
+
+// Guesses allowed per issued code before it is burned. Small enough that a
+// 6-digit code can't be brute-forced (≈8 / 900000), large enough for typos.
+const MAX_CODE_ATTEMPTS = 8;
 
 // POST /reset/request — send a reset code to email
 router.post("/request", async (req: Request, res: Response) => {
@@ -65,8 +70,8 @@ router.post("/verify", async (req: Request, res: Response) => {
     if (!email || !code || !newPassword) {
       return res.status(400).json({ error: "Email, code et nouveau mot de passe requis" });
     }
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: "Le mot de passe doit contenir au moins 6 caractères" });
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: "Le mot de passe doit contenir au moins 8 caractères" });
     }
 
     const db = getDb();
@@ -83,10 +88,11 @@ router.post("/verify", async (req: Request, res: Response) => {
 
     const userId = userResult.rows[0].id as string;
 
-    // Find valid code
+    // Look up the ACTIVE code by user (not by the submitted value) so a wrong
+    // guess still burns an attempt — otherwise the 6-digit space is brute-forceable.
     const codeResult = await db.execute({
-      sql: "SELECT id, expires_at FROM reset_codes WHERE user_id = ? AND code = ? AND used = 0",
-      args: [userId, code.trim()],
+      sql: "SELECT id, code, expires_at, attempts FROM reset_codes WHERE user_id = ? AND used = 0 ORDER BY created_at DESC LIMIT 1",
+      args: [userId],
     });
 
     if (codeResult.rows.length === 0) {
@@ -94,26 +100,39 @@ router.post("/verify", async (req: Request, res: Response) => {
     }
 
     const resetRow = codeResult.rows[0];
-    const expiresAt = new Date(resetRow.expires_at as string);
 
-    if (expiresAt < new Date()) {
+    if (new Date(resetRow.expires_at as string) < new Date()) {
       return res.status(400).json({ error: "Code expiré. Demandez un nouveau code." });
     }
 
-    // Mark code as used
+    // Too many wrong guesses on this code → burn it, force a fresh request.
+    if (Number(resetRow.attempts ?? 0) >= MAX_CODE_ATTEMPTS) {
+      await db.execute({ sql: "UPDATE reset_codes SET used = 1 WHERE id = ?", args: [resetRow.id as string] });
+      return res.status(429).json({ error: "Trop de tentatives. Demandez un nouveau code." });
+    }
+
+    // Count this attempt before comparing (so wrong guesses count too).
+    await db.execute({ sql: "UPDATE reset_codes SET attempts = attempts + 1 WHERE id = ?", args: [resetRow.id as string] });
+
+    if (String(resetRow.code) !== String(code).trim()) {
+      return res.status(400).json({ error: "Code invalide ou expiré" });
+    }
+
+    // Match → consume the code.
     await db.execute({
       sql: "UPDATE reset_codes SET used = 1 WHERE id = ?",
       args: [resetRow.id as string],
     });
 
-    // Update password
+    // Update password AND revoke every existing session: a reset is exactly the
+    // "someone had my password" case, so all tokens issued before now are killed.
     const passwordHash = await bcrypt.hash(newPassword, 12);
     await db.execute({
-      sql: "UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?",
-      args: [passwordHash, userId],
+      sql: "UPDATE users SET password_hash = ?, tokens_valid_after = ?, updated_at = datetime('now') WHERE id = ?",
+      args: [passwordHash, new Date().toISOString(), userId],
     });
 
-    console.log(`[RESET] Password updated for ${email}`);
+    console.log(`[RESET] Password updated + sessions revoked for ${email}`);
     return res.json({ success: true });
   } catch (err: any) {
     console.error("[RESET] Verify error:", err.message);

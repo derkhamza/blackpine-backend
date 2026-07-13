@@ -9,14 +9,13 @@
  */
 import { Router, Request, Response } from "express";
 import { getDb } from "../db/database";
-import { authRequired } from "../middleware/auth";
+import { authRequired, JWT_SECRET } from "../middleware/auth";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import { decryptField } from "../crypto/dataCipher";
 
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET || "blackpine-dev-secret-change-in-production";
 
 const normUser = (s: string) => s.trim().toLowerCase();
 
@@ -129,7 +128,7 @@ router.post("/login", async (req: Request, res: Response) => {
     const secretaryToken = jwt.sign(
       { type: "secretary", ownerUserId, secretaryId, accountId },
       JWT_SECRET,
-      { expiresIn: "365d" },
+      { expiresIn: "365d", algorithm: "HS256" },
     );
     // A session row makes the token revocable via the existing secretary middleware.
     await db.execute({
