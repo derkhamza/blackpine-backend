@@ -264,7 +264,7 @@ router.get("/doctors", authRequired, async (req: Request, res: Response) => {
   if (!isAdmin(req)) return res.status(403).json({ error: "Accès réservé" });
   try {
     const db = getDb();
-    const users = await db.execute("SELECT id, email, created_at, subscription_plan, subscription_expires_at FROM users");
+    const users = await db.execute("SELECT id, email, created_at, trial_start, subscription_plan, subscription_expires_at FROM users");
     const snaps = await db.execute("SELECT owner_user_id, appointments, patients, doctor_profile, updated_at FROM cabinet_snapshots");
     const evRows = await db.execute("SELECT user_id, count(*) c, max(created_at) last FROM analytics_events GROUP BY user_id");
     const secRows = await db.execute("SELECT owner_user_id, count(*) c FROM secretary_accounts WHERE revoked = 0 GROUP BY owner_user_id");
@@ -290,6 +290,7 @@ router.get("/doctors", authRequired, async (req: Request, res: Response) => {
         createdAt: String(u.created_at),
         plan: u.subscription_plan ? String(u.subscription_plan) : "free_trial",
         expiresAt: u.subscription_expires_at ? String(u.subscription_expires_at) : null,
+        trialStart: u.trial_start ? String(u.trial_start) : null,
         lastActive: snap ? String(snap.updated_at) : null,
         specialty: s.specialty,
         commune: s.commune,

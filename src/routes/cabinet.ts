@@ -663,10 +663,10 @@ router.get("/pull", secretaryAuthRequired, async (req: Request, res: Response) =
     const { ownerUserId } = (req as any).secretary;
     const db = getDb();
 
-    // Light conditional-GET path — see /cabinet/my. Read updated_at first so an
-    // unchanged desk poll never pulls the full encrypted snapshot from Turso.
+    // Light conditional-GET path — see /cabinet/my. Read updated_at + col_versions
+    // first so an unchanged desk poll never pulls the full encrypted snapshot.
     const verRow = await db.execute({
-      sql: "SELECT updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
+      sql: "SELECT updated_at, col_versions FROM cabinet_snapshots WHERE owner_user_id = ?",
       args: [ownerUserId],
     });
     if (verRow.rows.length === 0) {
@@ -679,9 +679,29 @@ router.get("/pull", secretaryAuthRequired, async (req: Request, res: Response) =
       return res.status(304).end();
     }
 
-    // Changed → fetch the full row.
+    // Per-column delta (see /cabinet/my). The desk only ever sees appointments,
+    // patients, doctorProfile and the apptDocuments attachments (inside
+    // extra_data) — other extra collections are never exposed to a secretary.
+    // Send only the columns whose version differs from the client's ?cv=; the
+    // extra_data fetch is itself gated on the `e` version, so an appointment edit
+    // no longer drags the patients list + attachments out of Neon.
+    const serverCv = parseColVersions(verRow.rows[0].col_versions as string | null);
+    const clientCv = parseColVersions(String(req.query.cv || "") || null);
+    const full = !serverCv || !clientCv;
+    const need = {
+      a: full || serverCv!.a !== clientCv!.a,
+      p: full || serverCv!.p !== clientCv!.p,
+      r: full || serverCv!.r !== clientCv!.r,
+      e: full || serverCv!.e !== clientCv!.e,
+    };
+
+    const cols = ["updated_at", "col_versions"];
+    if (need.a) cols.push("appointments");
+    if (need.p) cols.push("patients");
+    if (need.r) cols.push("doctor_profile");
+    if (need.e) cols.push("extra_data");
     const result = await db.execute({
-      sql: "SELECT appointments, patients, doctor_profile, extra_data, updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
+      sql: `SELECT ${cols.join(", ")} FROM cabinet_snapshots WHERE owner_user_id = ?`,
       args: [ownerUserId],
     });
     if (result.rows.length === 0) {
@@ -690,20 +710,20 @@ router.get("/pull", secretaryAuthRequired, async (req: Request, res: Response) =
     const row = result.rows[0];
     res.setHeader("ETag", snapshotEtag(row.updated_at as string));
 
-    const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
-    const docsArr = Array.isArray(extra.apptDocuments) ? extra.apptDocuments : [];
-    const docsVer = apptDocsVersion(docsArr);
-    const body: any = {
-      appointments: JSON.parse(decryptField(row.appointments as string)),
-      patients: JSON.parse(decryptField(row.patients as string)),
-      doctorProfile: JSON.parse(decryptField(row.doctor_profile as string)),
-      apptDocumentsVersion: docsVer,
-    };
-    // Appointment attachments: the desk attaches analyses / mutuelle forms /
-    // scans, so the secretary sees and adds them (no other extra collection is
-    // exposed to secretary sessions). Sent only when the client's version is
-    // stale — omission means "keep the copy you already have".
-    if (String(req.query.docsVersion || "") !== docsVer) body.apptDocuments = docsArr;
+    // Always echo the full col_versions baseline; data columns ride only when changed.
+    const body: any = { colVersions: (row.col_versions as string) || null };
+    if (need.a) body.appointments  = JSON.parse(decryptField(row.appointments as string));
+    if (need.p) body.patients      = JSON.parse(decryptField(row.patients as string));
+    if (need.r) body.doctorProfile = JSON.parse(decryptField(row.doctor_profile as string));
+    if (need.e) {
+      const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
+      const docsArr = Array.isArray(extra.apptDocuments) ? extra.apptDocuments : [];
+      const docsVer = apptDocsVersion(docsArr);
+      body.apptDocumentsVersion = docsVer;
+      // Attachments are heavy + rarely change — send only when the client's
+      // version is stale; omission means "keep the copy you already have".
+      if (String(req.query.docsVersion || "") !== docsVer) body.apptDocuments = docsArr;
+    }
     return res.json(body);
   } catch (err: any) {
     console.error("[CABINET] Pull error:", err.message);
