@@ -122,6 +122,12 @@ router.get("/events", authRequired, async (req: Request, res: Response) => {
       sql: "SELECT COALESCE(platform,'web') p, count(*) c, count(DISTINCT user_id) u FROM analytics_events WHERE created_at >= ? GROUP BY p ORDER BY c DESC",
       args: [cut],
     });
+    // Activity distribution across the hours of the day (created_at is UTC ISO
+    // text; the client shifts to local time for display).
+    const byHour = await db.execute({
+      sql: "SELECT substr(created_at,12,2) h, count(*) c FROM analytics_events WHERE created_at >= ? GROUP BY h ORDER BY h",
+      args: [cut],
+    });
 
     const events = (top.rows as any[]).map(r => ({ name: String(r.name), count: num(r) }));
     const pages = events.filter(e => e.name.startsWith("page:"));
@@ -136,6 +142,7 @@ router.get("/events", authRequired, async (req: Request, res: Response) => {
       topActions: actions.slice(0, 20),
       byDay: (byDay.rows as any[]).map(r => ({ date: String(r.d), count: num(r) })),
       byPlatform: (byPlat.rows as any[]).map(r => ({ platform: String(r.p), count: num(r), users: num(r, "u") })),
+      byHour: (byHour.rows as any[]).map(r => ({ hour: Number(r.h), count: num(r) })),
     });
   } catch (err: any) {
     console.error("[ADMIN] events error:", err.message);
@@ -321,6 +328,7 @@ router.get("/doctors/:id", authRequired, async (req: Request, res: Response) => 
     const plat = await db.execute({ sql: "SELECT COALESCE(platform,'web') p, count(*) c FROM analytics_events WHERE user_id = ? GROUP BY p ORDER BY c DESC", args: [id] });
     const names = await db.execute({ sql: "SELECT name, count(*) c FROM analytics_events WHERE user_id = ? GROUP BY name ORDER BY c DESC LIMIT 40", args: [id] });
     const byDay = await db.execute({ sql: "SELECT substr(created_at,1,10) d, count(*) c FROM analytics_events WHERE user_id = ? AND created_at >= ? GROUP BY d ORDER BY d", args: [id, cut30] });
+    const byHour = await db.execute({ sql: "SELECT substr(created_at,12,2) h, count(*) c FROM analytics_events WHERE user_id = ? GROUP BY h ORDER BY h", args: [id] });
     const evTot = await db.execute({ sql: "SELECT count(*) c, max(created_at) last FROM analytics_events WHERE user_id = ?", args: [id] });
     const booking = await db.execute({ sql: "SELECT enabled FROM booking_links WHERE owner_user_id = ?", args: [id] });
     const sms = await db.execute({ sql: "SELECT enabled FROM sms_config WHERE owner_user_id = ?", args: [id] });
@@ -347,6 +355,7 @@ router.get("/doctors/:id", authRequired, async (req: Request, res: Response) => 
       topPages: allNames.filter((e) => e.name.startsWith("page:")).slice(0, 12),
       topActions: allNames.filter((e) => e.name.startsWith("action:")).slice(0, 12),
       byDay: (byDay.rows as any[]).map((r) => ({ date: String(r.d), count: num(r) })),
+      byHour: (byHour.rows as any[]).map((r) => ({ hour: Number(r.h), count: num(r) })),
     });
   } catch (err: any) {
     console.error("[ADMIN] doctor detail error:", err.message);
