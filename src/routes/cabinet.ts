@@ -310,6 +310,7 @@ router.post("/push", authRequired, subscriptionRequired, async (req: Request, re
       employees, prescriptionTemplates, prescriptions, certificates,
       stockItems, waTemplates, teleSessions, notes, suppliers,
       purchaseOrders, examResults, invoices, apptDocuments,
+      examRequests, medicalReports,
     } = req.body;
 
     const extraData = JSON.stringify({
@@ -326,6 +327,8 @@ router.post("/push", authRequired, subscriptionRequired, async (req: Request, re
       examResults:           examResults           ?? [],
       invoices:              invoices              ?? [],
       apptDocuments:         apptDocuments         ?? [],
+      examRequests:          examRequests          ?? [],
+      medicalReports:        medicalReports        ?? [],
     });
 
     const db = getDb();
