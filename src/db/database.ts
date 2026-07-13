@@ -28,7 +28,7 @@ export interface DbClient {
 let sqlFn: NeonQueryFunction<false, true> | null = null;
 let client: DbClient | null = null;
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 // Hard ceiling per query. Neon HTTP calls don't hang like a raw TCP connect, but
 // this keeps a slow network from ever riding the function's 300s ceiling.
@@ -170,6 +170,9 @@ const SCHEMA: string[] = [
      owner_user_id TEXT PRIMARY KEY, appointments TEXT NOT NULL DEFAULT '[]', patients TEXT NOT NULL DEFAULT '[]',
      doctor_profile TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL DEFAULT ${NOW_ISO},
      extra_data TEXT DEFAULT '{}')`,
+  // Per-column content versions (JSON {a,p,r,e}) so a pull can skip columns the
+  // client already has — cuts Neon egress. Null on legacy rows → pull sends full.
+  `ALTER TABLE cabinet_snapshots ADD COLUMN IF NOT EXISTS col_versions TEXT`,
   `CREATE TABLE IF NOT EXISTS cabinet_backups (
      id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL, created_at TEXT NOT NULL, reason TEXT NOT NULL DEFAULT 'auto',
      appointments TEXT NOT NULL DEFAULT '[]', patients TEXT NOT NULL DEFAULT '[]',

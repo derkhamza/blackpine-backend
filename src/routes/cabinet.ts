@@ -24,6 +24,35 @@ function apptDocsVersion(docs: unknown[]): string {
   return crypto.createHash("sha1").update(JSON.stringify(docs ?? [])).digest("base64url");
 }
 
+// Per-column content versions (JSON {a,p,r,e}) so a pull can send only the columns
+// the client doesn't already hold, cutting Neon egress. Hash the PLAINTEXT JSON —
+// encryption uses a random IV, so ciphertext isn't stable per content.
+const colvHash = (json: string) => crypto.createHash("sha1").update(json).digest("base64url").slice(0, 12);
+function buildColVersions(apptsJson: string, patientsJson: string, profileJson: string, extraJson: string): string {
+  return JSON.stringify({ a: colvHash(apptsJson), p: colvHash(patientsJson), r: colvHash(profileJson), e: colvHash(extraJson) });
+}
+type ColVersions = { a: string; p: string; r: string; e: string };
+function parseColVersions(raw: string | null | undefined): ColVersions | null {
+  if (!raw) return null;
+  try {
+    const o = JSON.parse(raw);
+    if (o && typeof o.a === "string" && typeof o.p === "string" && typeof o.r === "string" && typeof o.e === "string") {
+      return { a: o.a, p: o.p, r: o.r, e: o.e };
+    }
+  } catch { /* malformed → treat as absent (full snapshot) */ }
+  return null;
+}
+// Recompute ONE column's version after a secretary slice write, preserving the
+// others (the secretary touched only this column). Returns null when the row has
+// no baseline yet — the doctor's next full push establishes all four; until then
+// the doctor pull safely falls back to full snapshots. Keeping the untouched
+// columns' hashes intact is what lets the doctor pull skip them.
+function bumpColVersion(prevRaw: string | null | undefined, key: keyof ColVersions, json: string): string | null {
+  const prev = parseColVersions(prevRaw);
+  if (!prev) return null;
+  return JSON.stringify({ ...prev, [key]: colvHash(json) });
+}
+
 // ── Automatic backups ─────────────────────────────────────────────────────────
 // Keep a rolling history of daily snapshots so a doctor can recover from an
 // accidental deletion or corruption that normal sync would otherwise propagate.
@@ -332,24 +361,31 @@ router.post("/push", authRequired, subscriptionRequired, async (req: Request, re
       }
     }
 
+    const apptsJson    = JSON.stringify(appointments ?? []);
+    const patientsJson = JSON.stringify(patients ?? []);
+    const profileJson  = JSON.stringify(doctorProfile ?? {});
+    const cv = buildColVersions(apptsJson, patientsJson, profileJson, extraData);
+
     await db.execute({
       sql: `INSERT INTO cabinet_snapshots
-              (owner_user_id, appointments, patients, doctor_profile, extra_data, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+              (owner_user_id, appointments, patients, doctor_profile, extra_data, updated_at, col_versions)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_user_id)
             DO UPDATE SET
               appointments   = excluded.appointments,
               patients       = excluded.patients,
               doctor_profile = excluded.doctor_profile,
               extra_data     = excluded.extra_data,
-              updated_at     = excluded.updated_at`,
+              updated_at     = excluded.updated_at,
+              col_versions   = excluded.col_versions`,
       args: [
         userId,
-        encryptField(JSON.stringify(appointments ?? [])),
-        encryptField(JSON.stringify(patients ?? [])),
-        encryptField(JSON.stringify(doctorProfile ?? {})),
+        encryptField(apptsJson),
+        encryptField(patientsJson),
+        encryptField(profileJson),
         encryptField(extraData),
         now,
+        cv,
       ],
     });
 
@@ -407,17 +443,26 @@ router.post("/restore", authRequired, subscriptionRequired, async (req: Request,
     await maybeCreateBackup(db, userId, "pre-restore", true);
 
     const now = new Date().toISOString();
+    // Recompute col_versions from the restored plaintext so the next delta pull
+    // sees the columns changed and re-sends them (otherwise a doctor on another
+    // device would keep the pre-restore data until the periodic full pull).
+    const apptsJson    = decryptField(b.appointments as string);
+    const patientsJson = decryptField(b.patients as string);
+    const profileJson  = decryptField(b.doctor_profile as string);
+    const extraJson    = decryptField((b.extra_data as string) || "{}");
+    const cv = buildColVersions(apptsJson, patientsJson, profileJson, extraJson);
     await db.execute({
       sql: `INSERT INTO cabinet_snapshots
-              (owner_user_id, appointments, patients, doctor_profile, extra_data, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+              (owner_user_id, appointments, patients, doctor_profile, extra_data, updated_at, col_versions)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_user_id)
             DO UPDATE SET
               appointments   = excluded.appointments,
               patients       = excluded.patients,
               doctor_profile = excluded.doctor_profile,
               extra_data     = excluded.extra_data,
-              updated_at     = excluded.updated_at`,
+              updated_at     = excluded.updated_at,
+              col_versions   = excluded.col_versions`,
       args: [
         userId,
         b.appointments as string,
@@ -425,17 +470,18 @@ router.post("/restore", authRequired, subscriptionRequired, async (req: Request,
         b.doctor_profile as string,
         (b.extra_data as string) ?? "{}",
         now,
+        cv,
       ],
     });
 
-    const extra = JSON.parse(decryptField((b.extra_data as string) || "{}"));
+    const extra = JSON.parse(extraJson);
     console.log(`[CABINET] Doctor ${userId} restored backup ${backupId}`);
     return res.json({
       success: true,
       snapshot: {
-        appointments:  JSON.parse(decryptField(b.appointments as string)),
-        patients:      JSON.parse(decryptField(b.patients as string)),
-        doctorProfile: JSON.parse(decryptField(b.doctor_profile as string)),
+        appointments:  JSON.parse(apptsJson),
+        patients:      JSON.parse(patientsJson),
+        doctorProfile: JSON.parse(profileJson),
         updatedAt:     now,
         ...extra,
       },
@@ -457,7 +503,7 @@ router.get("/my", authRequired, async (req: Request, res: Response) => {
     // snapshot out of Turso just to be discarded. Tag by updated_at and answer
     // with a bodyless 304 — cuts function duration + DB egress on the hot path.
     const verRow = await db.execute({
-      sql: "SELECT updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
+      sql: "SELECT updated_at, col_versions FROM cabinet_snapshots WHERE owner_user_id = ?",
       args: [userId],
     });
     if (verRow.rows.length === 0) {
@@ -470,39 +516,64 @@ router.get("/my", authRequired, async (req: Request, res: Response) => {
       return res.status(304).end();
     }
 
-    // Changed → now fetch the full row.
+    // Per-column delta: something changed (ETag differs), but usually only ONE
+    // column did. Send only the columns whose content version differs from what
+    // the client already holds — the client passes its last-seen versions in
+    // ?cv=<json {a,p,r,e}>. This is the real Neon-egress win: an appointment edit
+    // no longer drags the patients list + all clinical extras out of the DB.
+    // Fall back to a FULL snapshot whenever either side lacks versions (a legacy
+    // row not yet rewritten, or the client's first delta-aware pull) — safety
+    // over savings. applySnapshot is partial-safe (absent column = keep current),
+    // and the client's periodic full pull self-heals any missed delta.
+    const serverCv = parseColVersions(verRow.rows[0].col_versions as string | null);
+    const clientCv = parseColVersions(String(req.query.cv || "") || null);
+    const full = !serverCv || !clientCv;
+    const need = {
+      a: full || serverCv!.a !== clientCv!.a,
+      p: full || serverCv!.p !== clientCv!.p,
+      r: full || serverCv!.r !== clientCv!.r,
+      e: full || serverCv!.e !== clientCv!.e,
+    };
+
+    // Fetch (and thus pull out of Neon) only the columns we actually need to send.
+    const cols = ["updated_at", "col_versions"];
+    if (need.a) cols.push("appointments");
+    if (need.p) cols.push("patients");
+    if (need.r) cols.push("doctor_profile");
+    if (need.e) cols.push("extra_data");
     const result = await db.execute({
-      sql: "SELECT appointments, patients, doctor_profile, extra_data, updated_at FROM cabinet_snapshots WHERE owner_user_id = ?",
+      sql: `SELECT ${cols.join(", ")} FROM cabinet_snapshots WHERE owner_user_id = ?`,
       args: [userId],
     });
     if (result.rows.length === 0) {
       return res.json(null); // deleted between the two reads
     }
     const row = result.rows[0];
-    // Re-tag from the full row so the client's stored ETag matches the body it
+    // Re-tag from the fetched row so the client's stored ETag matches the body it
     // actually received (guards the rare change-between-reads race).
     res.setHeader("ETag", snapshotEtag(row.updated_at as string));
 
-    const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
-
-    // Attachments (base64 scans/PDFs) are the heaviest part of the snapshot but
-    // rarely change, so don't re-send them just because an appointment or
-    // patient changed. Version them separately; include the bytes only when the
-    // client's version is stale. The client leaves its copy untouched when the
-    // field is absent, so omission = "you already have the current files".
-    const { apptDocuments: docs, ...restExtra } = extra;
-    const docsArr = Array.isArray(docs) ? docs : [];
-    const docsVer = apptDocsVersion(docsArr);
-
+    // Always send updatedAt + colVersions so the client can store the new
+    // per-column baseline; data columns ride along only when changed.
     const body: any = {
-      appointments:          JSON.parse(decryptField(row.appointments as string)),
-      patients:              JSON.parse(decryptField(row.patients as string)),
-      doctorProfile:         JSON.parse(decryptField(row.doctor_profile as string)),
-      updatedAt:             row.updated_at,
-      apptDocumentsVersion:  docsVer,
-      ...restExtra,
+      updatedAt:   row.updated_at,
+      colVersions: (row.col_versions as string) || null,
     };
-    if (String(req.query.docsVersion || "") !== docsVer) body.apptDocuments = docsArr;
+    if (need.a) body.appointments  = JSON.parse(decryptField(row.appointments as string));
+    if (need.p) body.patients      = JSON.parse(decryptField(row.patients as string));
+    if (need.r) body.doctorProfile = JSON.parse(decryptField(row.doctor_profile as string));
+    if (need.e) {
+      const extra = JSON.parse(decryptField((row.extra_data as string) || "{}"));
+      // Attachments (base64 scans/PDFs) are the heaviest part of extra_data but
+      // rarely change, so version them separately and include the bytes only when
+      // the client's version is stale (absent = "you already have the files").
+      const { apptDocuments: docs, ...restExtra } = extra;
+      const docsArr = Array.isArray(docs) ? docs : [];
+      const docsVer = apptDocsVersion(docsArr);
+      Object.assign(body, restExtra);
+      body.apptDocumentsVersion = docsVer;
+      if (String(req.query.docsVersion || "") !== docsVer) body.apptDocuments = docsArr;
+    }
     return res.json(body);
   } catch (err: any) {
     console.error("[CABINET] My pull error:", err.message);
@@ -660,7 +731,7 @@ router.post(
       // Merge against the current server array so clinical fields are preserved
       // and the doctor's concurrent records are never lost.
       const cur = await db.execute({
-        sql: "SELECT appointments FROM cabinet_snapshots WHERE owner_user_id = ?",
+        sql: "SELECT appointments, col_versions FROM cabinet_snapshots WHERE owner_user_id = ?",
         args: [ownerUserId],
       });
       const serverAppts = cur.rows.length ? JSON.parse(decryptField(cur.rows[0].appointments as string)) : [];
@@ -701,9 +772,11 @@ router.post(
         merged = merged.filter((a: any) => !gone.has(a.id));
       }
 
+      const mergedJson = JSON.stringify(merged);
+      const cv = bumpColVersion(cur.rows[0]?.col_versions as string | null, "a", mergedJson);
       await db.execute({
-        sql: "UPDATE cabinet_snapshots SET appointments = ?, updated_at = ? WHERE owner_user_id = ?",
-        args: [encryptField(JSON.stringify(merged)), now, ownerUserId],
+        sql: "UPDATE cabinet_snapshots SET appointments = ?, updated_at = ?, col_versions = ? WHERE owner_user_id = ?",
+        args: [encryptField(mergedJson), now, cv, ownerUserId],
       });
 
       await maybeCreateBackup(db, ownerUserId);
@@ -739,7 +812,7 @@ router.post(
       });
 
       const cur = await db.execute({
-        sql: "SELECT extra_data FROM cabinet_snapshots WHERE owner_user_id = ?",
+        sql: "SELECT extra_data, col_versions FROM cabinet_snapshots WHERE owner_user_id = ?",
         args: [ownerUserId],
       });
       const extra = cur.rows.length
@@ -758,9 +831,11 @@ router.post(
       }
 
       extra.apptDocuments = merged;
+      const extraJson = JSON.stringify(extra);
+      const cv = bumpColVersion(cur.rows[0]?.col_versions as string | null, "e", extraJson);
       await db.execute({
-        sql: "UPDATE cabinet_snapshots SET extra_data = ?, updated_at = ? WHERE owner_user_id = ?",
-        args: [encryptField(JSON.stringify(extra)), now, ownerUserId],
+        sql: "UPDATE cabinet_snapshots SET extra_data = ?, updated_at = ?, col_versions = ? WHERE owner_user_id = ?",
+        args: [encryptField(extraJson), now, cv, ownerUserId],
       });
 
       return res.json({ success: true, updatedAt: now, apptDocuments: merged });
@@ -794,7 +869,7 @@ router.post(
       // Merge against the current server array so clinical fields (allergies,
       // antecedents, medications, …) are preserved and records aren't lost.
       const cur = await db.execute({
-        sql: "SELECT patients FROM cabinet_snapshots WHERE owner_user_id = ?",
+        sql: "SELECT patients, col_versions FROM cabinet_snapshots WHERE owner_user_id = ?",
         args: [ownerUserId],
       });
       const serverPatients = cur.rows.length ? JSON.parse(decryptField(cur.rows[0].patients as string)) : [];
@@ -808,9 +883,11 @@ router.post(
         merged = merged.filter((p: any) => !gone.has(p.id));
       }
 
+      const mergedJson = JSON.stringify(merged);
+      const cv = bumpColVersion(cur.rows[0]?.col_versions as string | null, "p", mergedJson);
       await db.execute({
-        sql: "UPDATE cabinet_snapshots SET patients = ?, updated_at = ? WHERE owner_user_id = ?",
-        args: [encryptField(JSON.stringify(merged)), now, ownerUserId],
+        sql: "UPDATE cabinet_snapshots SET patients = ?, updated_at = ?, col_versions = ? WHERE owner_user_id = ?",
+        args: [encryptField(mergedJson), now, cv, ownerUserId],
       });
 
       await maybeCreateBackup(db, ownerUserId);
