@@ -16,7 +16,9 @@ const router = Router();
 router.post("/generate-code", async (req, res) => {
   try {
     const { adminSecret, plan, durationDays, customerEmail, customerName } = req.body;
-    if (adminSecret !== process.env.ADMIN_SECRET) {
+    // Fail CLOSED: an unset/empty ADMIN_SECRET must never authorize (otherwise
+    // `undefined !== undefined` → false → the guard is skipped and anyone can mint codes).
+    if (!process.env.ADMIN_SECRET || adminSecret !== process.env.ADMIN_SECRET) {
       return res.status(403).json({ error: "Non autorisé" });
     }
 
@@ -79,7 +81,7 @@ router.post("/validate-code", authRequired, async (req, res) => {
 router.get("/codes", async (req, res) => {
   try {
     const { adminSecret } = req.query;
-    if (adminSecret !== process.env.ADMIN_SECRET) {
+    if (!process.env.ADMIN_SECRET || adminSecret !== process.env.ADMIN_SECRET) {
       return res.status(403).json({ error: "Non autorisé" });
     }
     const db = getDb();

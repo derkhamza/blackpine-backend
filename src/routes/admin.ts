@@ -512,6 +512,12 @@ export const USER_TABLES: { table: string; col: string }[] = [
   { table: "sms_config",         col: "owner_user_id" },
   { table: "sms_log",            col: "owner_user_id" },
   { table: "push_tokens",        col: "owner_user_id" },
+  // Later-added user-keyed tables — must also be cleared so "delete my data"
+  // leaves no residual PHI (chat/signals carry patient names). GDPR / loi 09-08.
+  { table: "cabinet_messages",   col: "owner_user_id" },
+  { table: "cabinet_signals",    col: "owner_user_id" },
+  { table: "web_push_subs",      col: "owner_user_id" },
+  { table: "subscription_events", col: "user_id" },
 ];
 
 async function loadUser(id: string) {

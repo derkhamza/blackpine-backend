@@ -1135,13 +1135,25 @@ router.post("/attachments", cabinetIdentity, async (req: Request, res: Response)
   }
 });
 
+// Validate that a caller-supplied blob URL is (a) a Vercel Blob host over HTTPS
+// and (b) this cabinet's own attachment path. A loose substring check would allow
+// SSRF (fetch internal hosts) and a cross-tenant decryption oracle (another
+// cabinet's blob whose URL merely *contains* our /att/<id>/ in a query string).
+function isOwnedBlobUrl(raw: string, ownerUserId: string): boolean {
+  let u: URL;
+  try { u = new URL(raw); } catch { return false; }
+  return u.protocol === "https:"
+    && u.hostname.endsWith(".public.blob.vercel-storage.com")
+    && u.pathname.startsWith(`/att/${ownerUserId}/`);
+}
+
 // Fetch + decrypt one attachment by its blob URL (scoped to this cabinet).
 router.post("/attachments/get", cabinetIdentity, async (req: Request, res: Response) => {
   if (!BLOB_ENABLED()) return res.status(501).json({ error: "Stockage objet non configuré" });
   try {
     const { ownerUserId } = (req as any).cab;
     const url = String(req.body?.url ?? "");
-    if (!url.includes(`/att/${ownerUserId}/`)) return res.status(403).json({ error: "Accès refusé" });
+    if (!isOwnedBlobUrl(url, ownerUserId)) return res.status(403).json({ error: "Accès refusé" });
     const r = await fetch(url);
     if (!r.ok) return res.status(404).json({ error: "Fichier introuvable" });
     const cipher = await r.text();
@@ -1158,7 +1170,7 @@ router.post("/attachments/del", cabinetIdentity, async (req: Request, res: Respo
   try {
     const { ownerUserId } = (req as any).cab;
     const url = String(req.body?.url ?? "");
-    if (!url.includes(`/att/${ownerUserId}/`)) return res.status(403).json({ error: "Accès refusé" });
+    if (!isOwnedBlobUrl(url, ownerUserId)) return res.status(403).json({ error: "Accès refusé" });
     const { del } = await import("@vercel/blob");
     await del(url);
     return res.json({ ok: true });

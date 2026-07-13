@@ -35,8 +35,11 @@ router.post("/unregister", authRequired, async (req: Request, res: Response) => 
   try {
     const token = String(req.body?.token ?? "").trim();
     if (!token) return res.json({ ok: true });
+    const ownerUserId = (req as any).user.userId;
     const db = getDb();
-    await db.execute({ sql: "DELETE FROM push_tokens WHERE token = ?", args: [token] });
+    // Scope to the caller's own tokens so one doctor can't unregister another's
+    // device (notification denial-of-service).
+    await db.execute({ sql: "DELETE FROM push_tokens WHERE token = ? AND owner_user_id = ?", args: [token, ownerUserId] });
     return res.json({ ok: true });
   } catch (err: any) {
     console.error("[PUSH] unregister error:", err.message);

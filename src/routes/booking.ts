@@ -246,8 +246,13 @@ router.post("/:slug/book", async (req: Request, res: Response) => {
     appts.push(appt);
 
     const now = new Date().toISOString();
+    // Reset col_versions to NULL so the per-column delta pull re-sends the full
+    // snapshot: the appointments column changed here, and without invalidating the
+    // version the doctor's ?cv= delta would think appointments were unchanged and
+    // SKIP the new booking until the periodic full pull. The next doctor push
+    // re-establishes the versions.
     await db.execute({
-      sql: "UPDATE cabinet_snapshots SET appointments = ?, updated_at = ? WHERE owner_user_id = ?",
+      sql: "UPDATE cabinet_snapshots SET appointments = ?, updated_at = ?, col_versions = NULL WHERE owner_user_id = ?",
       args: [encryptField(JSON.stringify(appts)), now, row.owner_user_id],
     });
 
