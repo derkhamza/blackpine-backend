@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import { getDb, logSubEvent } from "../db/database";
 import { generateToken } from "../middleware/auth";
+import { hitLimit, clearLimit } from "../middleware/rateLimit";
 import { consumeVerificationCode } from "./verify";
 import crypto from "crypto";
 const uuid = () => crypto.randomUUID();
@@ -80,6 +81,14 @@ router.post("/login", async (req: Request, res: Response) => {
 
     const db = getDb();
 
+    // Per-account brute-force cap, independent of the per-IP limiter (which keys
+    // on a spoofable header). One account can't be hammered beyond N tries per
+    // window regardless of how many IPs the attacker rotates through.
+    const acctKey = "login-acct:" + email.toLowerCase().trim();
+    if (await hitLimit(acctKey, 10, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: "Trop de tentatives pour ce compte. Réessayez dans quelques minutes." });
+    }
+
     const result = await db.execute({
       sql: "SELECT id, email, password_hash, trial_start, subscription_plan, subscription_expires_at FROM users WHERE email = ?",
       args: [email.toLowerCase().trim()],
@@ -99,6 +108,9 @@ router.post("/login", async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Email ou mot de passe incorrect" });
     }
 
+    // Correct login → clear the per-account throttle so earlier mistypes don't
+    // count against a now-authenticated user.
+    void clearLimit(acctKey);
     const token = generateToken({ userId: user.id as string, email: user.email as string });
     console.log(`[AUTH] User logged in: ${email}`);
 

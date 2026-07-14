@@ -129,7 +129,11 @@ router.get("/finance", authRequired, async (req: Request, res: Response) => {
 
     for (const u of users.rows as any[]) {
       const plan = String(u.plan || "free_trial");
-      const exp = u.subscription_expires_at ? new Date(String(u.subscription_expires_at)).getTime() : null;
+      // Normalise a malformed expiry to null (unknown) instead of NaN, so the
+      // active-check and the new Date(exp).toISOString() below can't 500 the
+      // whole finance dashboard.
+      const expRaw = u.subscription_expires_at ? new Date(String(u.subscription_expires_at)).getTime() : null;
+      const exp = expRaw != null && Number.isFinite(expRaw) ? expRaw : null;
       const cm = monthKey(String(u.created_at || ""));
       if (cm) signupsByMonthMap[cm] = (signupsByMonthMap[cm] || 0) + 1;
 

@@ -48,6 +48,13 @@ async function storeEvents(userId: string, names: string[], platform: string, co
       args: ["ev_" + crypto.randomBytes(8).toString("hex"), userId, name, platform, now, country],
     });
   }
+  // Opportunistic retention prune (~2% of writes) so analytics_events can't grow
+  // unbounded. 400 days keeps a full year of history (year-over-year usage) plus
+  // slack. Best-effort — never blocks ingestion; the created_at index makes it cheap.
+  if (Math.random() < 0.02) {
+    const cutoff = new Date(Date.now() - 400 * 86400000).toISOString();
+    db.execute({ sql: "DELETE FROM analytics_events WHERE created_at < ?", args: [cutoff] }).catch(() => { /* best-effort */ });
+  }
 }
 
 // ── Doctor (and web) events ───────────────────────────────────────────────────

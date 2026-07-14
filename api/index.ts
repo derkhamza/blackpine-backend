@@ -24,7 +24,29 @@ import accountRoutes from "../src/routes/account";
 import { rateLimit } from "../src/middleware/rateLimit";
 import { isCipherActive } from "../src/crypto/dataCipher";
 
+// Give the platform a function timeout ABOVE the code's own 25s request deadline
+// (REQUEST_DEADLINE_MS below), so our graceful 503 fires first instead of the
+// platform killing the invocation at its ~10-15s default (leaving the client with
+// a bare 504). Read by @vercel/node at build time. (vercel.json can't use the
+// `functions` key here because it already uses `builds`.)
+export const maxDuration = 30;
+
 const app = express();
+
+// Security headers on every response (helmet-equivalent, hand-rolled to avoid a
+// dependency for a JSON-only API). The API never returns rendered HTML to a
+// browser context, so a strict CSP + frame denial + nosniff are safe and close
+// the "no security headers" gap without touching CORS (handled below).
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-DNS-Prefetch-Control", "off");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  next();
+});
 
 // gzip/brotli every response big enough to matter. The sync pulls are large
 // JSON payloads, so this is a major cut in Fast Origin Transfer (bytes served

@@ -142,14 +142,24 @@ async function secretaryAuthRequired(
       return res.status(401).json({ error: "Token invalide" });
     }
 
-    // Verify the session hasn't been revoked
+    // Verify the session hasn't been revoked, AND that the owner hasn't reset
+    // their password / "logged out everywhere" since this token was minted — the
+    // owner's tokens_valid_after is a cabinet-wide revocation point that must also
+    // kill long-lived (365d) secretary tokens, not just the doctor's own.
     const db = getDb();
     const result = await db.execute({
-      sql: "SELECT revoked FROM secretary_sessions WHERE id = ?",
-      args: [decoded.secretaryId],
+      sql: `SELECT s.revoked AS revoked, u.tokens_valid_after AS cutoff
+              FROM secretary_sessions s
+              LEFT JOIN users u ON u.id = ?
+             WHERE s.id = ?`,
+      args: [decoded.ownerUserId, decoded.secretaryId],
     });
 
     if (result.rows.length === 0 || (result.rows[0].revoked as number) === 1) {
+      return res.status(401).json({ error: "Accès révoqué" });
+    }
+    const cutoff = result.rows[0].cutoff as string | null | undefined;
+    if (cutoff && decoded.iat && decoded.iat < Math.floor(new Date(cutoff).getTime() / 1000)) {
       return res.status(401).json({ error: "Accès révoqué" });
     }
 
@@ -647,9 +657,23 @@ function mergeSecretaryWrite(
     result.push(merged);
   }
 
-  // 2. Append brand-new records the secretary created (id not on server).
+  // 2. Append brand-new records the secretary created (id not on server), but
+  // FILTER them to the same allow-list — otherwise a tampered client could stamp
+  // clinical fields (examen, diagnostic, traitement…) onto a new record, since
+  // step 1's whitelist only guards records that already exist on the server.
+  // The permitted clinical bits (consultationNote.motif / extraFields) are re-
+  // added selectively by the caller after this merge.
+  const STRUCTURAL = ["createdAt", "updatedAt"]; // harmless metadata, no clinical content
   for (const [id, inc] of incomingById) {
-    if (!serverById.has(id)) result.push(inc);
+    if (serverById.has(id)) continue;
+    const clean: any = { id };
+    for (const f of allowedFields) {
+      if (Object.prototype.hasOwnProperty.call(inc, f)) clean[f] = inc[f];
+    }
+    for (const f of STRUCTURAL) {
+      if (Object.prototype.hasOwnProperty.call(inc, f)) clean[f] = inc[f];
+    }
+    result.push(clean);
   }
 
   return result;
@@ -937,10 +961,17 @@ async function cabinetIdentity(req: Request, res: Response, next: NextFunction) 
     if (decoded.type === "secretary") {
       const db = getDb();
       const r = await db.execute({
-        sql: "SELECT revoked FROM secretary_sessions WHERE id = ?",
-        args: [decoded.secretaryId],
+        sql: `SELECT s.revoked AS revoked, u.tokens_valid_after AS cutoff
+                FROM secretary_sessions s
+                LEFT JOIN users u ON u.id = ?
+               WHERE s.id = ?`,
+        args: [decoded.ownerUserId, decoded.secretaryId],
       });
       if (r.rows.length === 0 || (r.rows[0].revoked as number) === 1) {
+        return res.status(401).json({ error: "Accès révoqué" });
+      }
+      const cutoff = r.rows[0].cutoff as string | null | undefined;
+      if (cutoff && decoded.iat && decoded.iat < Math.floor(new Date(cutoff).getTime() / 1000)) {
         return res.status(401).json({ error: "Accès révoqué" });
       }
       (req as any).cab = { ownerUserId: decoded.ownerUserId, role: "secretary" };

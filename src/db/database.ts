@@ -265,6 +265,14 @@ async function doInit(): Promise<void> {
     // schema_meta absent (fresh DB) → fall through and create everything.
   }
 
+  // NOTE: this runs only on a version bump (the fast-path above returns otherwise),
+  // and the first post-deploy request that trips it blocks until every statement
+  // finishes. `CREATE INDEX IF NOT EXISTS` on an already-large existing table takes
+  // an ACCESS EXCLUSIVE lock for the build. Existing indexes are no-op re-checks, so
+  // this is fine today — but a FUTURE index added to a big table (cabinet_snapshots,
+  // analytics_events…) should be created out-of-band with CREATE INDEX CONCURRENTLY
+  // (which cannot run here — it can't be inside a transaction/batch), not added to
+  // this list, to avoid a migration stalling every request behind the lock.
   for (const stmt of SCHEMA) await runQuery(stmt, []);
   await runQuery(
     `INSERT INTO schema_meta (id, version) VALUES (1, ${SCHEMA_VERSION})

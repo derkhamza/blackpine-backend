@@ -23,17 +23,39 @@ export async function extractFromReceipt(imageBuffer: Buffer): Promise<OcrResult
     OCREngine: "2",
   });
 
+  const empty: OcrResult = { rawText: "", amounts: [], dates: [], bestAmount: null, bestDate: null, confidence: 0 };
+
   const res = await fetch("https://api.ocr.space/parse/image", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: formBody.toString(),
   });
 
-  const data = await res.json();
+  // OCR.space can return a non-JSON body (quota exceeded → HTML, gateway 5xx,
+  // bad key). Guard the status and the parse so a soft failure degrades to an
+  // empty result instead of throwing an opaque 500 up the route.
+  if (!res.ok) {
+    console.log("[OCR] HTTP error:", res.status);
+    return empty;
+  }
+
+  let data: any;
+  try {
+    data = await res.json();
+  } catch (err: any) {
+    console.log("[OCR] Non-JSON response:", err?.message || err);
+    return empty;
+  }
+
+  if (data.IsErroredOnProcessing) {
+    const msg = Array.isArray(data.ErrorMessage) ? data.ErrorMessage.join("; ") : data.ErrorMessage;
+    console.log("[OCR] API reported error:", msg);
+    return empty;
+  }
 
   if (!data.ParsedResults || data.ParsedResults.length === 0) {
     console.log("[OCR] No results from API");
-    return { rawText: "", amounts: [], dates: [], bestAmount: null, bestDate: null, confidence: 0 };
+    return empty;
   }
 
   const text = data.ParsedResults[0].ParsedText || "";
