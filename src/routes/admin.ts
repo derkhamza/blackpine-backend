@@ -455,11 +455,14 @@ router.get("/doctors/:id", authRequired, async (req: Request, res: Response) => 
     const snap = snapR.rows[0] as any;
     const s = snap ? snapSummary(snap) : { appts: 0, patients: 0, online: 0, specialty: "", commune: "" };
 
-    const cut30 = new Date(Date.now() - 30 * 86400000).toISOString();
-    const plat = await db.execute({ sql: "SELECT COALESCE(platform,'web') p, count(*) c FROM analytics_events WHERE user_id = ? GROUP BY p ORDER BY c DESC", args: [id] });
-    const names = await db.execute({ sql: "SELECT name, count(*) c FROM analytics_events WHERE user_id = ? GROUP BY name ORDER BY c DESC LIMIT 40", args: [id] });
-    const byDay = await db.execute({ sql: "SELECT substr(created_at,1,10) d, count(*) c FROM analytics_events WHERE user_id = ? AND created_at >= ? GROUP BY d ORDER BY d", args: [id, cut30] });
-    const byHour = await db.execute({ sql: "SELECT substr(created_at,12,2) h, count(*) c FROM analytics_events WHERE user_id = ? GROUP BY h ORDER BY h", args: [id] });
+    // Selectable analytics window (7 / 30 / 90 days). Applied to every time-based
+    // series so the per-doctor view is explorable, not stuck at 30 days.
+    const days = Math.min(365, Math.max(1, parseInt(String(req.query.days ?? "30"), 10) || 30));
+    const cut = new Date(Date.now() - days * 86400000).toISOString();
+    const plat = await db.execute({ sql: "SELECT COALESCE(platform,'web') p, count(*) c FROM analytics_events WHERE user_id = ? AND created_at >= ? GROUP BY p ORDER BY c DESC", args: [id, cut] });
+    const names = await db.execute({ sql: "SELECT name, count(*) c FROM analytics_events WHERE user_id = ? AND created_at >= ? GROUP BY name ORDER BY c DESC LIMIT 40", args: [id, cut] });
+    const byDay = await db.execute({ sql: "SELECT substr(created_at,1,10) d, count(*) c FROM analytics_events WHERE user_id = ? AND created_at >= ? GROUP BY d ORDER BY d", args: [id, cut] });
+    const byHour = await db.execute({ sql: "SELECT substr(created_at,12,2) h, count(*) c FROM analytics_events WHERE user_id = ? AND created_at >= ? GROUP BY h ORDER BY h", args: [id, cut] });
     const evTot = await db.execute({ sql: "SELECT count(*) c, max(created_at) last FROM analytics_events WHERE user_id = ?", args: [id] });
     const booking = await db.execute({ sql: "SELECT enabled FROM booking_links WHERE owner_user_id = ?", args: [id] });
     const sms = await db.execute({ sql: "SELECT enabled FROM sms_config WHERE owner_user_id = ?", args: [id] });
@@ -487,6 +490,7 @@ router.get("/doctors/:id", authRequired, async (req: Request, res: Response) => 
       topActions: allNames.filter((e) => e.name.startsWith("action:")).slice(0, 12),
       byDay: (byDay.rows as any[]).map((r) => ({ date: String(r.d), count: num(r) })),
       byHour: (byHour.rows as any[]).map((r) => ({ hour: Number(r.h), count: num(r) })),
+      days,
     });
   } catch (err: any) {
     console.error("[ADMIN] doctor detail error:", err.message);
