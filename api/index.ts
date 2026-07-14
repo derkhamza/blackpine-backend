@@ -126,6 +126,24 @@ app.use("/events", rateLimit(120, 15 * 60 * 1000), eventsRoutes);
 // Self-service account + data deletion (auth, GDPR / Play requirement).
 app.use("/account", rateLimit(10, 15 * 60 * 1000), authRequired, accountRoutes);
 
+// Turn body-parser's raw 413 into a clean, detectable JSON error. A cabinet push
+// exceeds the 20 MB limit only when attachments inline into the snapshot (i.e.
+// Vercel Blob is unconfigured — see BLOB_READ_WRITE_TOKEN). Without this the client
+// gets an opaque 413 and shows a generic "sync failed"; with it, the web app can
+// surface "too many attachments / storage not configured".
+app.use((err: any, _req: any, res: any, next: any) => {
+  if (err && (err.type === "entity.too.large" || err.status === 413 || err.statusCode === 413)) {
+    return res.status(413).json({ error: "cabinet_too_large" });
+  }
+  return next(err);
+});
+
+// Operator warning: without Blob storage, attachments inline into the snapshot and
+// a busy cabinet will eventually 413 on push. Logged once per cold start.
+if (!process.env.BLOB_READ_WRITE_TOKEN) {
+  console.warn("[STARTUP] BLOB_READ_WRITE_TOKEN unset — attachments inline into the snapshot; large cabinets will 413 on sync. Configure Vercel Blob.");
+}
+
 // De-duplicate initialization across concurrent cold-start requests: they all
 // await the same promise instead of each running the full schema sweep. If init
 // fails (transient Turso hiccup), reset so the next request can retry cleanly.

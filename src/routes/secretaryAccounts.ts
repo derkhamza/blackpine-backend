@@ -102,6 +102,29 @@ router.delete("/:id", authRequired, async (req: Request, res: Response) => {
   }
 });
 
+// ── Doctor: permanently delete an ALREADY-REVOKED secretary account ───────────
+// Lets the doctor clear old revoked rows so they don't pile up forever. Only a
+// revoked account can be purged (must revoke first), and only by its owner; this
+// also frees the (globally-unique) username for reuse.
+router.delete("/:id/purge", authRequired, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.userId;
+    const id = String(req.params.id);
+    const db = getDb();
+    const r = await db.execute({
+      sql: "DELETE FROM secretary_accounts WHERE id = ? AND owner_user_id = ? AND revoked = 1",
+      args: [id, userId],
+    });
+    if (r.rowsAffected === 0) return res.status(404).json({ error: "Compte introuvable ou non révoqué" });
+    await db.execute({ sql: "DELETE FROM secretary_sessions WHERE account_id = ?", args: [id] });
+    console.log(`[SEC-ACCT] Doctor ${userId} purged secretary account ${id}`);
+    return res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[SEC-ACCT] purge error", err);
+    return res.status(500).json({ error: "Erreur serveur" });
+  }
+});
+
 // ── Secretary: log in with username + password (public) ───────────────────────
 router.post("/login", async (req: Request, res: Response) => {
   try {
